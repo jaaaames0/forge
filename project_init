@@ -1,0 +1,216 @@
+You are bootstrapping FORGE — a self-hosted personal gym and workout tracking web app. 
+FORGE is a companion/sister app to SPENCE (a kitchen inventory and nutrition tracker). 
+It lives at /srv/jaaaames.com/forge/ and is inspired by the 'Strong' iOS app 
+(https://help.strongapp.io/) but stripped to just core workout tracking and data 
+presentation. No social features, no GIF library, no external integrations.
+
+== INSPIRATION: SPENCE ==
+
+FORGE should copy these patterns wholesale from SPENCE (/srv/jaaaames.com/spence/):
+
+AUTH:
+- Same single-key session auth pattern as core/auth.php. 
+- Key loaded from getenv('FORGE_ACCESS_KEY') or a non-committed credentials file.
+- Include auth.php as the FIRST line of every page AND every API endpoint.
+
+DB:
+- PDO SQLite3, same pattern as core/db_helper.php.
+- get_db_connection() in core/db_helper.php returns PDO with ERRMODE_EXCEPTION and 
+  busy_timeout 5000.
+- Timezone: Australia/Sydney via date_default_timezone_set().
+
+API PATTERN:
+- POST-only JSON endpoints in core/ (e.g. core/api.php).
+- All actions dispatched via $_POST['action'].
+- Wrap everything in try/catch, return {'status':'error','message':'...'} on failure.
+- Use PDO prepared statements everywhere.
+
+UI:
+- Bootstrap 5.3 dark theme. Background #121212, cards #1a1a1a, border #333, 
+  accent color per module (define a per-page accent, like SPENCE uses per data-context).
+- Sticky top navbar, same layout as core/header.php. Brand name "FORGE" in bold 
+  with accent color.
+- Font-weight 900 labels in uppercase, monospaced stats, muted secondary labels.
+- Vanilla fetch() for all AJAX — no jQuery.
+- Bootstrap Icons (bi-*) for all iconography.
+- Chart.js for all data visualisation (loaded from CDN).
+
+FILE STRUCTURE (mirror SPENCE):
+/forge/
+  index.php               — Dashboard (recent workouts, weekly volume, quick PR summary)
+  core/
+    auth.php              — Session auth
+    db_helper.php         — PDO connection + helper functions
+    api.php               — CRUD: exercises, workouts, sets, templates
+    progress_api.php      — 1RM estimates, PR history, volume queries
+  workout/
+    index.php             — Active workout logger (the core UX)
+  history/
+    index.php             — Past workouts list + detail view
+  exercises/
+    index.php             — Exercise library (browse, add custom)
+  progress/
+    index.php             — Progression charts per exercise, volume trends
+  templates/
+    index.php             — Workout templates (create, edit, start from template)
+  settings/
+    index.php             — User preferences (units kg/lbs, default rest timer, 
+                             progression scheme)
+  database/
+    schema.sql
+    forge_empty.db        — Blank template committed to git
+  .gitignore              — forge.db, uploads/, credentials.env
+
+== DATABASE SCHEMA ==
+
+exercises (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  category TEXT,              -- 'Barbell', 'Dumbbell', 'Machine', 'Cable', 
+                              --  'Bodyweight', 'Cardio', 'Other'
+  muscle_primary TEXT,        -- 'Chest', 'Back', 'Legs', 'Shoulders', 'Arms', 
+                              --  'Core', 'Glutes', 'Cardio'
+  muscle_secondary TEXT,
+  is_custom INTEGER DEFAULT 0,
+  notes TEXT
+)
+
+workouts (
+  id INTEGER PRIMARY KEY,
+  name TEXT,
+  template_id INTEGER REFERENCES templates(id),
+  started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  finished_at DATETIME,
+  notes TEXT,
+  bodyweight_kg REAL          -- optional snapshot, can pull from SPENCE vitals
+)
+
+workout_sets (
+  id INTEGER PRIMARY KEY,
+  workout_id INTEGER NOT NULL REFERENCES workouts(id),
+  exercise_id INTEGER NOT NULL REFERENCES exercises(id),
+  set_number INTEGER,
+  set_type TEXT DEFAULT 'working',  -- 'warmup', 'working', 'dropset', 'failure'
+  weight_kg REAL,
+  reps INTEGER,
+  rpe REAL,                   -- Rate of Perceived Exertion 6.0–10.0
+  -- Cardio fields (null for strength):
+  duration_sec INTEGER,
+  distance_km REAL,
+  notes TEXT
+)
+
+templates (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  notes TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+
+template_exercises (
+  id INTEGER PRIMARY KEY,
+  template_id INTEGER NOT NULL REFERENCES templates(id),
+  exercise_id INTEGER NOT NULL REFERENCES exercises(id),
+  order_num INTEGER,
+  target_sets INTEGER,
+  target_reps_min INTEGER,
+  target_reps_max INTEGER,
+  target_rpe REAL,
+  progression_scheme TEXT DEFAULT 'double', -- 'linear', 'double', 'rpe'
+  progression_increment_kg REAL DEFAULT 2.5
+)
+
+personal_records (
+  id INTEGER PRIMARY KEY,
+  exercise_id INTEGER NOT NULL REFERENCES exercises(id),
+  weight_kg REAL,
+  reps INTEGER,
+  estimated_1rm REAL,
+  achieved_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+
+== KEY DOMAIN LOGIC ==
+
+1RM ESTIMATION (implement in progress_api.php and inline JS):
+  - Epley:   estimated_1rm = weight × (1 + reps / 30)
+  - Brzycki: estimated_1rm = weight / (1.0278 − 0.0278 × reps)
+  - Use Epley as default. Only calculate for reps > 1 and reps <= 12.
+  - Auto-insert/update personal_records after every set save if estimated_1rm 
+    exceeds current record.
+
+PROGRESSION SUGGESTIONS (in progress_api.php):
+  - 'linear': After a successful session (hit all target reps), suggest 
+    +increment_kg next session.
+  - 'double': Target is rep range (e.g. 3×8-12). If all sets hit top of range, 
+    suggest +increment_kg and drop back to bottom of range. Otherwise suggest 
+    same weight, aim for more reps.
+  - 'rpe': If last session average RPE < target_rpe - 1, suggest +2.5kg. 
+    If RPE > target_rpe, suggest same or -2.5kg.
+  Show suggestion as a banner when starting a workout from a template.
+
+WORKOUT LOGGER UX (workout/index.php — the most important page):
+  - Persistent in-progress workout state stored in the DB (started_at set, 
+    no finished_at yet).
+  - Exercises listed vertically. Each exercise has a set table with columns: 
+    Set# | Previous (last session weight×reps) | Weight | Reps | RPE | ✓
+  - "Previous" column auto-populated from most recent workout_sets for that 
+    exercise — crucial for continuity.
+  - Add Set button appends a row. Long-press or swipe on set row to delete.
+  - Rest timer: configurable countdown (default 90s), shows after ticking a set.
+  - "Finish Workout" button sets finished_at, calculates total volume (sum of 
+    weight × reps per working set), updates PRs.
+
+PROGRESS CHARTS (progress/index.php using Chart.js):
+  - Per-exercise: estimated 1RM over time (line chart), volume per session 
+    (bar chart), weight used at specific rep count over time.
+  - Overview: total weekly volume (bar chart), workout frequency heatmap 
+    (calendar-style using a canvas grid), muscle group distribution (donut chart 
+    from last 30 days).
+
+EXERCISE LIBRARY:
+  - Pre-seed with ~50 common exercises (barbell squat, deadlift, bench press, 
+    OHP, row, pull-up, etc.) on first run — detect empty exercises table and 
+    INSERT the seed data.
+  - Custom exercises can be added. is_custom = 1.
+
+== WHAT TO BUILD FIRST ==
+
+Build in this order:
+1. core/ (auth, db_helper, api, progress_api) + database/schema.sql
+2. workout/index.php — the active logger (most critical, most used)
+3. history/index.php
+4. progress/index.php with Chart.js charts
+5. exercises/index.php
+6. templates/index.php
+7. Dashboard index.php
+8. settings/index.php
+
+== WHAT NOT TO BUILD ==
+
+- No user accounts (single user like SPENCE)
+- No exercise GIF/video integration
+- No Apple Health / Google Fit sync
+- No social features
+- No paid tiers or premium gates
+- No workout sharing
+- No barcode scanning (not relevant)
+- No push notifications
+
+== LINK TO SPENCE ==
+
+FORGE and SPENCE are sister apps. Cross-link them in their navbars 
+(a small "SPENCE" link in FORGE's nav pointing to /spence/, and vice versa). 
+The visual language must be consistent: same dark theme, same Bootstrap 5.3 
+version, same font stack, same uppercase bold label style. The accent color 
+for FORGE is #FF5722 (deep orange — contrasts with SPENCE's #00A3FF blue).
+
+== TECH STACK SUMMARY ==
+
+- PHP 8.2+ (no framework)
+- PDO SQLite3
+- Bootstrap 5.3.0 (CDN)
+- Bootstrap Icons 1.11.0 (CDN)
+- Chart.js 4.x (CDN)
+- Vanilla JS (fetch API, no jQuery, no bundler, no build step)
+- Nginx + PHP-FPM
+- Git repository at /srv/jaaaames.com/forge/

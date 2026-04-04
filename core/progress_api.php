@@ -1,0 +1,437 @@
+<?php
+/**
+ * FORGE Progress API — 1RM history, PR summary, volume queries, progression suggestions
+ * POST-only, JSON responses, action-dispatched via $_POST['action']
+ */
+require_once __DIR__ . '/auth.php';
+require_once __DIR__ . '/db_helper.php';
+
+header('Content-Type: application/json');
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
+    echo json_encode(['status' => 'error', 'message' => 'POST only']);
+    exit;
+}
+
+$db     = get_db_connection();
+$action = $_POST['action'] ?? '';
+
+try {
+
+    // =========================================================
+    // PER-EXERCISE PROGRESS
+    // =========================================================
+
+    if ($action === 'get_exercise_progress') {
+        // Returns estimated 1RM over time, volume per session, weight at rep count
+        $exercise_id = (int)($_POST['exercise_id'] ?? 0);
+        if (!$exercise_id) throw new Exception('exercise_id required');
+
+        $formula = 'epley';
+
+        // 1RM over time — best e1RM per session
+        // reps=1 → actual 1RM (weight_kg); reps 2-12 → Epley estimate
+        $stmt = $db->prepare("
+            SELECT DATE(w.started_at) as date,
+                   MAX(CASE
+                       WHEN ws.reps = 1 AND ws.weight_kg > 0
+                       THEN ws.weight_kg
+                       WHEN ws.reps > 1 AND ws.reps <= 12 AND ws.weight_kg > 0
+                       THEN ws.weight_kg * (1 + ws.reps / 30.0)
+                       ELSE NULL
+                   END) as estimated_1rm
+            FROM workout_sets ws
+            JOIN workouts w ON w.id = ws.workout_id
+            WHERE ws.exercise_id = ?
+              AND w.finished_at IS NOT NULL
+              AND ws.set_type = 'working'
+            GROUP BY DATE(w.started_at)
+            ORDER BY date ASC
+        ");
+        $stmt->execute([$exercise_id]);
+        $one_rm_history = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Volume per session (working sets only)
+        $stmt = $db->prepare("
+            SELECT DATE(w.started_at) as date,
+                   SUM(ws.weight_kg * ws.reps) as volume_kg
+            FROM workout_sets ws
+            JOIN workouts w ON w.id = ws.workout_id
+            WHERE ws.exercise_id = ?
+              AND w.finished_at IS NOT NULL
+              AND ws.set_type = 'working'
+              AND ws.weight_kg IS NOT NULL
+              AND ws.reps IS NOT NULL
+            GROUP BY DATE(w.started_at)
+            ORDER BY date ASC
+        ");
+        $stmt->execute([$exercise_id]);
+        $volume_history = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Current PR
+        $pr = $db->prepare("SELECT * FROM personal_records WHERE exercise_id = ? ORDER BY estimated_1rm DESC LIMIT 1");
+        $pr->execute([$exercise_id]);
+        $current_pr = $pr->fetch(PDO::FETCH_ASSOC);
+
+        echo json_encode([
+            'status' => 'success',
+            'data'   => [
+                'one_rm_history'  => $one_rm_history,
+                'volume_history'  => $volume_history,
+                'current_pr'      => $current_pr,
+            ]
+        ]);
+
+    // =========================================================
+    // DASHBOARD / OVERVIEW
+    // =========================================================
+
+    } elseif ($action === 'get_pr_summary') {
+        // Best PR per exercise (top 10 by estimated 1RM)
+        $stmt = $db->query("
+            SELECT pr.*, e.name as exercise_name, e.muscle_primary
+            FROM personal_records pr
+            JOIN exercises e ON e.id = pr.exercise_id
+            WHERE pr.id IN (
+                SELECT id FROM personal_records p2
+                WHERE p2.exercise_id = pr.exercise_id
+                ORDER BY p2.estimated_1rm DESC
+                LIMIT 1
+            )
+            ORDER BY pr.estimated_1rm DESC
+            LIMIT 10
+        ");
+        echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+
+    } elseif ($action === 'get_weekly_volume') {
+        // Total volume per week for the last 12 weeks
+        $stmt = $db->query("
+            SELECT strftime('%Y-W%W', w.started_at) as week,
+                   SUM(ws.weight_kg * ws.reps) as volume_kg,
+                   COUNT(DISTINCT w.id) as workout_count
+            FROM workout_sets ws
+            JOIN workouts w ON w.id = ws.workout_id
+            WHERE w.finished_at IS NOT NULL
+              AND ws.set_type = 'working'
+              AND ws.weight_kg IS NOT NULL
+              AND ws.reps IS NOT NULL
+              AND w.started_at >= date('now', '-84 days')
+            GROUP BY week
+            ORDER BY week ASC
+        ");
+        echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+
+    } elseif ($action === 'get_muscle_distribution') {
+        // Volume per muscle group from the last 30 days
+        $stmt = $db->query("
+            SELECT e.muscle_primary,
+                   SUM(ws.weight_kg * ws.reps) as volume_kg,
+                   COUNT(ws.id) as set_count
+            FROM workout_sets ws
+            JOIN exercises e ON e.id = ws.exercise_id
+            JOIN workouts w ON w.id = ws.workout_id
+            WHERE w.finished_at IS NOT NULL
+              AND ws.set_type = 'working'
+              AND ws.weight_kg IS NOT NULL
+              AND ws.reps IS NOT NULL
+              AND w.started_at >= date('now', '-30 days')
+            GROUP BY e.muscle_primary
+            ORDER BY volume_kg DESC
+        ");
+        echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+
+    } elseif ($action === 'get_workout_frequency') {
+        // Workout dates for the last 365 days (for heatmap)
+        $stmt = $db->query("
+            SELECT DATE(started_at) as date, COUNT(*) as count
+            FROM workouts
+            WHERE finished_at IS NOT NULL
+              AND started_at >= date('now', '-365 days')
+            GROUP BY DATE(started_at)
+            ORDER BY date ASC
+        ");
+        echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+
+    } elseif ($action === 'get_recent_workouts') {
+        $limit = min((int)($_POST['limit'] ?? 5), 20);
+        $stmt  = $db->prepare("
+            SELECT w.*,
+                   COUNT(DISTINCT ws.exercise_id) as exercise_count,
+                   SUM(CASE WHEN ws.set_type='working' THEN ws.weight_kg * ws.reps ELSE 0 END) as total_volume_kg
+            FROM workouts w
+            LEFT JOIN workout_sets ws ON ws.workout_id = w.id
+            WHERE w.finished_at IS NOT NULL
+            GROUP BY w.id
+            ORDER BY w.started_at DESC
+            LIMIT ?
+        ");
+        $stmt->execute([$limit]);
+        echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+
+    // =========================================================
+    // PROGRESSION SUGGESTIONS
+    // =========================================================
+
+    } elseif ($action === 'get_progression_suggestion') {
+        // Returns a weight suggestion for a template exercise based on last session
+        $template_exercise_id = (int)($_POST['template_exercise_id'] ?? 0);
+        if (!$template_exercise_id) throw new Exception('template_exercise_id required');
+
+        $te = $db->prepare("SELECT * FROM template_exercises WHERE id = ?");
+        $te->execute([$template_exercise_id]);
+        $te = $te->fetch(PDO::FETCH_ASSOC);
+        if (!$te) throw new Exception('Template exercise not found');
+
+        // Find the most recent completed session for this exercise
+        // GROUP BY w.id ensures aggregates are scoped to one workout
+        $last = $db->prepare("
+            SELECT w.id as workout_id, w.finished_at,
+                   COUNT(ws.id) as set_count,
+                   AVG(ws.rpe) as avg_rpe,
+                   MIN(ws.reps) as min_reps,
+                   MAX(ws.reps) as max_reps,
+                   MAX(ws.weight_kg) as max_weight,
+                   MAX(ws.added_weight_kg) as max_added_weight
+            FROM workout_sets ws
+            JOIN workouts w ON w.id = ws.workout_id
+            WHERE ws.exercise_id = ?
+              AND ws.set_type = 'working'
+              AND w.finished_at IS NOT NULL
+            GROUP BY w.id
+            ORDER BY w.finished_at DESC
+            LIMIT 1
+        ");
+        $last->execute([$te['exercise_id']]);
+        $last_session = $last->fetch(PDO::FETCH_ASSOC);
+
+        if (!$last_session || !$last_session['workout_id']) {
+            echo json_encode(['status' => 'success', 'data' => ['suggestion' => null, 'message' => 'No previous session']]);
+            exit;
+        }
+
+        $scheme    = $te['progression_scheme'] ?? 'double';
+        $increment = (float)($te['progression_increment_kg'] ?? 2.5);
+        // For bodyweight exercises use added_weight as the progression reference
+        $is_bw       = $last_session['max_added_weight'] !== null;
+        $prog_weight = $is_bw ? (float)$last_session['max_added_weight'] : (float)$last_session['max_weight'];
+        $suggestion  = null;
+        $increase    = false;
+        $message     = '';
+
+        if ($scheme === 'linear') {
+            $target_sets = (int)($te['target_sets'] ?? 3);
+            $target_reps = (int)($te['target_reps_min'] ?? 5);
+            $hit_all = (int)$last_session['set_count'] >= $target_sets
+                    && (int)$last_session['min_reps'] >= $target_reps;
+            if ($hit_all) {
+                $suggestion = $prog_weight + $increment;
+                $increase   = true;
+                $message    = "All {$target_sets}×{$target_reps} hit — up {$increment}kg";
+            } else {
+                $suggestion = $prog_weight;
+                $message    = "Push for all {$target_sets}×{$target_reps} reps";
+            }
+
+        } elseif ($scheme === 'double') {
+            $reps_min = (int)($te['target_reps_min'] ?? 8);
+            $reps_max = (int)($te['target_reps_max'] ?? 12);
+            $target_sets = (int)($te['target_sets'] ?? 3);
+            $min_reps    = (int)$last_session['min_reps'];
+            $set_count   = (int)$last_session['set_count'];
+            $hit_top = $min_reps >= $reps_max && $set_count >= $target_sets;
+            if ($hit_top) {
+                $suggestion = $prog_weight + $increment;
+                $increase   = true;
+                $message    = "All {$target_sets} sets hit {$reps_max} reps — add {$increment}kg, aim for {$reps_min}+";
+            } else {
+                $suggestion = $prog_weight;
+                $message    = "Push for {$reps_max} reps on all {$target_sets} sets (best: {$min_reps})";
+            }
+
+        } elseif ($scheme === 'rpe') {
+            $target_rpe = (float)($te['target_rpe'] ?? 8.0);
+            $avg_rpe    = $last_session['avg_rpe'] ? round((float)$last_session['avg_rpe'], 1) : null;
+            if ($avg_rpe && $avg_rpe < $target_rpe - 1) {
+                $suggestion = $prog_weight + 2.5;
+                $increase   = true;
+                $message    = "Avg RPE {$avg_rpe} (target {$target_rpe}) — add 2.5kg";
+            } elseif ($avg_rpe && $avg_rpe > $target_rpe + 0.5) {
+                $suggestion = max(0, $prog_weight - 2.5);
+                $message    = "Avg RPE {$avg_rpe} above target — consider −2.5kg";
+            } else {
+                $suggestion = $prog_weight;
+                $message    = "RPE on target — maintain weight";
+            }
+        }
+
+        echo json_encode([
+            'status' => 'success',
+            'data'   => [
+                'suggestion'  => $suggestion,
+                'increase'    => $increase,
+                'message'     => $message,
+                'prog_weight' => $prog_weight,
+                'is_bw'       => $is_bw,
+                'scheme'      => $scheme,
+                'last_session' => $last_session,
+            ]
+        ]);
+
+    // =========================================================
+    // CARDIO HISTORY (time-series per exercise)
+    // =========================================================
+
+    } elseif ($action === 'get_cardio_history') {
+        $exercise_id = (int)($_POST['exercise_id'] ?? 0);
+        if (!$exercise_id) throw new Exception('exercise_id required');
+
+        $stmt = $db->prepare("
+            SELECT DATE(w.started_at) as date,
+                   ws.duration_sec, ws.distance_km, ws.hr_avg, ws.hr_max, ws.intensity,
+                   CASE WHEN ws.duration_sec > 0 AND ws.distance_km > 0
+                        THEN ROUND(ws.distance_km / (ws.duration_sec / 3600.0), 3)
+                        ELSE NULL END as avg_speed_kmh,
+                   CASE WHEN ws.duration_sec > 0 AND ws.distance_km > 0 AND ws.hr_avg > 0
+                        THEN ROUND(ws.distance_km / (ws.duration_sec / 3600.0) / ws.hr_avg * 1000, 3)
+                        ELSE NULL END as cardiac_efficiency
+            FROM workout_sets ws
+            JOIN workouts w ON w.id = ws.workout_id
+            WHERE ws.exercise_id = ?
+              AND w.finished_at IS NOT NULL
+            ORDER BY w.started_at ASC
+        ");
+        $stmt->execute([$exercise_id]);
+        echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+
+    // =========================================================
+    // CARDIO PRs
+    // =========================================================
+
+    } elseif ($action === 'get_cardio_prs') {
+        // Best record per type, optionally filtered to one exercise
+        $exercise_id = !empty($_POST['exercise_id']) ? (int)$_POST['exercise_id'] : null;
+
+        if ($exercise_id) {
+            $stmt = $db->prepare("
+                SELECT cr.*, e.name as exercise_name
+                FROM cardio_records cr
+                JOIN exercises e ON e.id = cr.exercise_id
+                WHERE cr.exercise_id = ?
+                  AND cr.id = (
+                      SELECT id FROM cardio_records
+                      WHERE exercise_id = cr.exercise_id AND record_type = cr.record_type
+                      ORDER BY value DESC LIMIT 1
+                  )
+                ORDER BY cr.record_type
+            ");
+            $stmt->execute([$exercise_id]);
+        } else {
+            $stmt = $db->query("
+                SELECT cr.*, e.name as exercise_name
+                FROM cardio_records cr
+                JOIN exercises e ON e.id = cr.exercise_id
+                WHERE cr.id = (
+                    SELECT id FROM cardio_records c2
+                    WHERE c2.exercise_id = cr.exercise_id AND c2.record_type = cr.record_type
+                    ORDER BY c2.value DESC LIMIT 1
+                )
+                ORDER BY e.name, cr.record_type
+            ");
+        }
+        echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+
+    // =========================================================
+    // PROGRESS PAGE — STRENGTH
+    // =========================================================
+
+    } elseif ($action === 'get_big4_trend') {
+        // Estimated 1RM over time for each Big 4 lift
+        $names = ['Barbell Back Squat', 'Barbell Bench Press', 'Deadlift', 'Overhead Press'];
+        $ph    = implode(',', array_fill(0, count($names), '?'));
+        $id_stmt = $db->prepare("SELECT id, name FROM exercises WHERE name IN ($ph)");
+        $id_stmt->execute($names);
+        $id_map = [];
+        foreach ($id_stmt->fetchAll(PDO::FETCH_ASSOC) as $row) $id_map[$row['id']] = $row['name'];
+
+        $result = [];
+        foreach ($id_map as $eid => $name) {
+            $stmt = $db->prepare("
+                SELECT DATE(w.started_at) as date,
+                       ROUND(MAX(ws.weight_kg * (1 + ws.reps / 30.0)), 1) as estimated_1rm
+                FROM workout_sets ws
+                JOIN workouts w ON w.id = ws.workout_id
+                WHERE ws.exercise_id = ?
+                  AND ws.reps > 1 AND ws.reps <= 12 AND ws.weight_kg > 0
+                  AND ws.set_type = 'working' AND w.finished_at IS NOT NULL
+                GROUP BY DATE(w.started_at)
+                ORDER BY date ASC
+            ");
+            $stmt->execute([$eid]);
+            $result[$name] = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+        echo json_encode(['status' => 'success', 'data' => $result]);
+
+    } elseif ($action === 'get_pr_board') {
+        // All exercises with PRs, ranked by set count then 1RM
+        $stmt = $db->query("
+            SELECT pr.exercise_id, pr.weight_kg, pr.reps, ROUND(pr.estimated_1rm, 1) as estimated_1rm,
+                   e.name as exercise_name, e.muscle_primary, e.category,
+                   (SELECT COUNT(*) FROM workout_sets ws2
+                    WHERE ws2.exercise_id = e.id AND ws2.set_type = 'working') as set_count
+            FROM personal_records pr
+            JOIN exercises e ON e.id = pr.exercise_id
+            WHERE pr.id = (
+                SELECT id FROM personal_records p2
+                WHERE p2.exercise_id = pr.exercise_id
+                ORDER BY p2.estimated_1rm DESC LIMIT 1
+            )
+            AND pr.estimated_1rm > 0
+            ORDER BY set_count DESC, pr.estimated_1rm DESC
+        ");
+        echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+
+    // =========================================================
+    // PROGRESS PAGE — CARDIO
+    // =========================================================
+
+    } elseif ($action === 'get_cardio_efficiency_trend') {
+        // Cardiac efficiency over time, grouped by exercise
+        $stmt = $db->query("
+            SELECT DATE(w.started_at) as date, e.name as exercise_name,
+                   ROUND(ws.distance_km / (ws.duration_sec / 3600.0) / ws.hr_avg * 1000, 3) as efficiency
+            FROM workout_sets ws
+            JOIN workouts w ON w.id = ws.workout_id
+            JOIN exercises e ON e.id = ws.exercise_id
+            WHERE w.finished_at IS NOT NULL AND e.category = 'Cardio'
+              AND ws.duration_sec > 0 AND ws.distance_km > 0 AND ws.hr_avg > 0
+            ORDER BY w.started_at ASC
+        ");
+        $by_ex = [];
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $r) {
+            $by_ex[$r['exercise_name']][] = ['date' => $r['date'], 'value' => (float)$r['efficiency']];
+        }
+        echo json_encode(['status' => 'success', 'data' => $by_ex]);
+
+    } elseif ($action === 'get_cardio_volume_trend') {
+        // Weekly cardio km + duration for last 12 weeks
+        $stmt = $db->query("
+            SELECT strftime('%Y-W%W', w.started_at) as week,
+                   ROUND(SUM(COALESCE(ws.distance_km, 0)), 2) as total_km,
+                   SUM(COALESCE(ws.duration_sec, 0)) as total_sec
+            FROM workout_sets ws
+            JOIN workouts w ON w.id = ws.workout_id
+            JOIN exercises e ON e.id = ws.exercise_id
+            WHERE w.finished_at IS NOT NULL AND e.category = 'Cardio'
+              AND w.started_at >= date('now', '-84 days')
+            GROUP BY week
+            ORDER BY week ASC
+        ");
+        echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+
+    } else {
+        throw new Exception('Unknown action: ' . htmlspecialchars($action));
+    }
+
+} catch (Exception $e) {
+    echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+}

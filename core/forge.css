@@ -1,0 +1,249 @@
+/* === FORGE Global Stylesheet — Mobile First === */
+
+/* Base */
+body { background-color: #121212; color: #e0e0e0; font-family: 'Inter', sans-serif; }
+
+/* Utilities */
+.fw-black  { font-weight: 900; letter-spacing: -1px; }
+.uppercase { text-transform: uppercase; }
+.text-muted  { color: #888 !important; }
+.text-accent { color: #FF5722 !important; }
+.x-small   { font-size: 0.7rem; }
+
+/* Cards */
+.card { background-color: #1e1e1e; border: 1px solid #333; color: #e0e0e0; }
+
+/* Tables */
+.table { color: #e0e0e0; vertical-align: middle; border-color: #333; }
+.table-dark { --bs-table-bg: #1e1e1e; --bs-table-border-color: #333; }
+
+/* -------------------------------------------------------
+   Forms — font-size 16px on all inputs prevents iOS from
+   zooming on focus (iOS zooms when font-size < 16px)
+------------------------------------------------------- */
+.form-control,
+.form-select {
+    background: #1a1a1a !important;
+    border: 1px solid #333 !important;
+    color: #fff !important;
+    font-size: 16px !important;
+    min-height: 44px;
+}
+.form-control::placeholder { color: #888 !important; opacity: 1; }
+.form-control:focus,
+.form-select:focus         { border-color: #FF5722 !important; box-shadow: 0 0 0 2px rgba(255,87,34,0.2) !important; outline: none; }
+.input-group .form-control       { background-color: #1a1a1a !important; border: 1px solid #333 !important; color: #fff !important; }
+.input-group .input-group-text   { background-color: #1a1a1a !important; border: 1px solid #333 !important; color: #888 !important; }
+
+/* Modals */
+.modal-content { background: #1e1e1e; border: 1px solid #444; color: #e0e0e0; }
+
+/* -------------------------------------------------------
+   Navigation
+------------------------------------------------------- */
+.forge-nav-link {
+    color: #888 !important;
+    font-weight: 700;
+    font-size: 0.82rem;
+    letter-spacing: 0.5px;
+    transition: color 0.15s;
+    border-bottom: 2px solid transparent;
+    padding: 8px 10px;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+}
+.forge-nav-link:hover  { color: #fff !important; }
+.forge-nav-link.active { color: #FF5722 !important; border-bottom-color: #FF5722; }
+
+/* Per-context accent overrides — currently all use #FF5722 */
+[data-context="workout"]   .forge-nav-link.active { color: #FF5722 !important; border-bottom-color: #FF5722; }
+[data-context="progress"]  .forge-nav-link.active { color: #FF5722 !important; border-bottom-color: #FF5722; }
+[data-context="history"]   .forge-nav-link.active { color: #FF5722 !important; border-bottom-color: #FF5722; }
+[data-context="exercises"] .forge-nav-link.active { color: #FF5722 !important; border-bottom-color: #FF5722; }
+[data-context="templates"] .forge-nav-link.active { color: #FF5722 !important; border-bottom-color: #FF5722; }
+[data-context="settings"]  .forge-nav-link.active { color: #6c757d !important; border-bottom-color: #6c757d; }
+
+/* -------------------------------------------------------
+   Buttons — all touch targets ≥ 44px tall
+------------------------------------------------------- */
+.btn { min-height: 44px; }
+.btn-forge {
+    background: #FF5722;
+    color: #fff;
+    font-weight: 900;
+    border: none;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+}
+.btn-forge:hover,
+.btn-forge:focus  { background: #E64A19; color: #fff; }
+.btn-forge:active { background: #BF360C; color: #fff; }
+
+.btn-forge-outline {
+    background: transparent;
+    color: #FF5722;
+    border: 2px solid #FF5722;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.btn-forge-outline:hover  { background: rgba(255,87,34,0.1); color: #FF5722; }
+
+.btn-icon {
+    background: none;
+    border: none;
+    color: #888;
+    padding: 0 8px;
+    cursor: pointer;
+    transition: color 0.2s;
+    min-height: 44px;
+    min-width: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+.btn-icon:hover .bi-pencil  { color: #ffc107; }
+.btn-icon:hover .bi-trash,
+.btn-icon:hover .bi-x-lg    { color: #ff4444; }
+.btn-icon:hover .bi-check-lg { color: #4caf50; }
+
+/* -------------------------------------------------------
+   Workout-specific components
+------------------------------------------------------- */
+
+/* Set table in workout logger */
+.set-table { width: 100%; border-collapse: collapse; }
+.set-table th {
+    font-size: 0.65rem;
+    font-weight: 900;
+    color: #666;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    padding: 6px 4px;
+    border-bottom: 1px solid #333;
+    text-align: center;
+}
+.set-table td {
+    padding: 4px 4px;
+    border-bottom: 1px solid #222;
+    text-align: center;
+    vertical-align: middle;
+}
+.set-table .input-set {
+    background: #1a1a1a;
+    border: 1px solid #333;
+    color: #fff;
+    text-align: center;
+    border-radius: 4px;
+    padding: 6px 2px;
+    font-size: 16px;  /* iOS no-zoom */
+    width: 100%;
+    min-width: 0;      /* allow inputs to shrink below browser default */
+    box-sizing: border-box;
+    min-height: 44px;
+}
+.set-table .input-set:focus { border-color: #FF5722; outline: none; }
+
+/* PR flash */
+.pr-flash {
+    background: rgba(255,87,34,0.15);
+    border: 1px solid #FF5722;
+    border-radius: 4px;
+}
+.pr-badge {
+    background: #FF5722;
+    color: #fff;
+    font-size: 0.6rem;
+    font-weight: 900;
+    padding: 1px 5px;
+    border-radius: 3px;
+    letter-spacing: 0.5px;
+    vertical-align: middle;
+}
+
+/* Warm-up set styling */
+.set-warmup td { opacity: 0.6; }
+.set-type-badge {
+    font-size: 0.6rem;
+    font-weight: 700;
+    padding: 2px 5px;
+    border-radius: 3px;
+    text-transform: uppercase;
+}
+.badge-warmup  { background: #37474f; color: #90a4ae; }
+.badge-working { background: #1b5e20; color: #a5d6a7; }
+.badge-dropset { background: #4a148c; color: #ce93d8; }
+.badge-failure { background: #7f0000; color: #ef9a9a; }
+
+/* Set action buttons (− SET / + DROP / + SET row) */
+.btn-set-action {
+    background: transparent;
+    border: 1px dashed #444;
+    color: #666;
+    font-weight: 700;
+    font-size: 0.78rem;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    min-height: 44px;
+    min-width: 72px;
+}
+
+
+/* Site-wide active workout bar (non-workout pages) */
+.active-bar {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: #0a0a0a;
+    border-top: 2px solid #FF5722;
+    padding: 8px 16px;
+    z-index: 1040;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-height: 58px;
+}
+
+/* -------------------------------------------------------
+   Stat labels (dashboard, progress)
+------------------------------------------------------- */
+.stat-label { font-size: 0.65rem; font-weight: 900; color: #666; letter-spacing: 1px; margin-bottom: 2px; text-transform: uppercase; }
+.stat-value { font-size: 1.4rem; font-weight: 900; color: #fff; line-height: 1; font-family: monospace; }
+.stat-unit  { font-size: 0.75rem; color: #888; margin-left: 2px; }
+
+/* Chart containers */
+.chart-container { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 1rem; }
+
+/* -------------------------------------------------------
+   Exercise cards / list items
+------------------------------------------------------- */
+.muscle-badge {
+    font-size: 0.6rem;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.muscle-chest     { background:#1a3a5c; color:#64b5f6; }
+.muscle-back      { background:#1a3324; color:#81c784; }
+.muscle-legs      { background:#3a2a00; color:#ffcc02; }
+.muscle-shoulders { background:#2d1b4e; color:#ce93d8; }
+.muscle-arms      { background:#3a1a1a; color:#ef9a9a; }
+.muscle-core      { background:#1a2a3a; color:#80deea; }
+.muscle-glutes    { background:#3a1a2a; color:#f48fb1; }
+.muscle-cardio    { background:#1a3a3a; color:#80cbc4; }
+
+/* -------------------------------------------------------
+   Responsive adjustments
+------------------------------------------------------- */
+@media (max-width: 575px) {
+    .container-fluid { padding-left: 12px; padding-right: 12px; }
+    .card-body { padding: 0.75rem; }
+    /* Ensure content doesn't hide behind the site-wide active workout bar */
+    body.workout-bar-active { padding-bottom: 70px; }
+    body.workout-bar-active.workout-bar-timer { padding-bottom: 80px; }
+}

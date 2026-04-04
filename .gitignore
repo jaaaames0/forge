@@ -1,0 +1,4 @@
+database/forge.db
+database/forge.db-wal
+database/forge.db-shm
+core/credentials.env

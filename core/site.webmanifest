@@ -1,0 +1,18 @@
+{
+  "name": "FORGE",
+  "short_name": "FORGE",
+  "description": "Gym workout tracker",
+  "start_url": "/forge/",
+  "display": "standalone",
+  "background_color": "#121212",
+  "theme_color": "#FF5722",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/forge/core/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

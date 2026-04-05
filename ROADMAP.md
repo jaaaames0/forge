@@ -27,5 +27,5 @@ SPENCE (`/srv/jaaaames.com/spence/`) handles diet and nutrition. Natural integra
 
 - **Workout notes per session** — how you felt, sleep, stress, etc. (field exists in schema, not exposed in UI yet).
 - **Plate calculator** — given a target weight and available plates, show the per-side loading.
-- **Warm-up set generator** — auto-suggest warm-up sets (e.g. 40% × 10, 60% × 5, 80% × 2) before working sets.
 - **Export** — CSV or JSON export of all workout history.
+- **Dedicated settings page** — if settings expand beyond a few toggles, move rest alerts + timer settings into a single gear-icon settings surface.

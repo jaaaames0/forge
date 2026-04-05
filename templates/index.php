@@ -176,6 +176,10 @@ if ($template_id) {
             style="font-weight:900; font-size:0.85rem; letter-spacing:1px; min-height:48px;">
         SAVE TEMPLATE
     </button>
+    <button class="btn w-100 mt-2" onclick="deleteCurrentTemplate()" type="button"
+            style="background:transparent; border:1px solid #5a1f1f; color:#ef5350; font-weight:800; letter-spacing:0.6px; min-height:44px;">
+        <i class="bi bi-trash me-1"></i>DELETE TEMPLATE
+    </button>
 
 </div>
 
@@ -295,6 +299,16 @@ async function saveTemplate() {
     btn.textContent = 'SAVED ✓';
     btn.disabled = false;
     setTimeout(() => { btn.textContent = 'SAVE TEMPLATE'; }, 1500);
+}
+
+async function deleteCurrentTemplate() {
+    if (!confirm('Delete this template? Past workouts stay in history.')) return;
+    const r = await api('delete_template', { id: TEMPLATE_ID });
+    if (r.status === 'success') {
+        window.location.href = '/forge/workout/';
+    } else {
+        alert(r.message || 'Failed to delete template');
+    }
 }
 
 // Remove template exercise
@@ -591,9 +605,10 @@ async function createTemplate() {
 }
 
 async function deleteTemplate(id, btn) {
-    if (!confirm('Delete this template?')) return;
+    if (!confirm('Delete this template? Past workouts stay in history.')) return;
     const r = await api('delete_template', { id });
     if (r.status === 'success') btn.closest('.card').remove();
+    else alert(r.message || 'Failed to delete template');
 }
 </script>
 

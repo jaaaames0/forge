@@ -780,6 +780,59 @@ function updateRestDisplay(id, seconds) {
     const s = String(seconds % 60).padStart(2, '0');
     document.getElementById(id).textContent = m + ':' + s;
 }
+
+// Notification toggle — delegates to forgeToggleNotifications in active_workout_bar.php
+async function handleNotifToggle(enable) {
+    if (typeof window.forgeToggleNotifications === 'function') {
+        await window.forgeToggleNotifications(enable);
+    } else {
+        if (!('Notification' in window)) {
+            updateNotifStatus();
+            return;
+        }
+        if (enable) {
+            if (Notification.permission === 'default') {
+                const result = await Notification.requestPermission();
+                if (result !== 'granted') {
+                    const toggle = document.getElementById('notif-toggle');
+                    if (toggle) toggle.checked = false;
+                    updateNotifStatus();
+                    return;
+                }
+            }
+            if (Notification.permission === 'granted') {
+                localStorage.setItem('forge_notify_rest', '1');
+            }
+        } else {
+            localStorage.removeItem('forge_notify_rest');
+        }
+    }
+    updateNotifStatus();
+}
+
+function updateNotifStatus() {
+    const toggle = document.getElementById('notif-toggle');
+    const status = document.getElementById('notif-status');
+    if (!toggle || !status) return;
+    const perm = ('Notification' in window) ? Notification.permission : 'unsupported';
+    const enabled = localStorage.getItem('forge_notify_rest') === '1' && perm === 'granted';
+    toggle.checked = enabled;
+    if (perm === 'denied') {
+        status.textContent = 'Blocked — enable in browser settings';
+        status.style.color = '#ef5350';
+        toggle.disabled = true;
+    } else if (!('Notification' in window)) {
+        status.textContent = 'Not supported in this browser';
+        toggle.disabled = true;
+    } else {
+        status.style.color = '#555';
+        status.textContent = enabled ? 'On — fires even when screen is off' : '';
+        toggle.disabled = false;
+    }
+}
+
+// Init toggle state when modal opens
+document.getElementById('restTimerModal')?.addEventListener('show.bs.modal', updateNotifStatus);
 </script>
 
 <!-- Rest Timer Modal -->
@@ -807,6 +860,20 @@ function updateRestDisplay(id, seconds) {
                        oninput="updateRestDisplay('<?= $rt['id'] ?>-disp', this.value)"
                        onchange="saveRestTimer('<?= $rt['key'] ?>', this.value)">
                 <?php endforeach; ?>
+
+                <hr style="border-color:#333; margin:8px 0 12px;">
+                <div class="d-flex align-items-center justify-content-between">
+                    <div>
+                        <span class="stat-label" style="font-size:0.62rem;">NOTIFICATIONS</span>
+                        <div class="text-muted" style="font-size:0.6rem;">System alert when rest ends</div>
+                    </div>
+                    <div class="form-check form-switch mb-0">
+                        <input class="form-check-input" type="checkbox" role="switch" id="notif-toggle"
+                               style="width:2.5em; height:1.4em; cursor:pointer; accent-color:#FF5722;"
+                               onchange="handleNotifToggle(this.checked)">
+                    </div>
+                </div>
+                <div id="notif-status" style="font-size:0.6rem; color:#555; margin-top:4px;"></div>
             </div>
             <div class="modal-footer" style="border-top:1px solid #333;">
                 <button type="button" class="btn btn-forge flex-grow-1" data-bs-dismiss="modal">DONE</button>

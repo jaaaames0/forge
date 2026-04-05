@@ -267,21 +267,19 @@ try {
             $weight_kg       = $effective > 0 ? $effective : null;
         }
 
-        if ($set_id) {
-            $db->prepare("UPDATE workout_sets SET set_number=?, set_type=?, weight_kg=?, reps=?, rpe=?, duration_sec=?, distance_km=?, added_weight_kg=?, hr_avg=?, hr_max=?, intensity=?, notes=? WHERE id=? AND workout_id=?")
-               ->execute([$set_number, $set_type, $weight_kg, $reps, $rpe, $duration, $distance, $added_weight_kg, $hr_avg, $hr_max, $intensity, $notes, $set_id, $workout_id]);
-        } else {
-            $db->prepare("INSERT INTO workout_sets (workout_id, exercise_id, set_number, set_type, weight_kg, reps, rpe, duration_sec, distance_km, added_weight_kg, hr_avg, hr_max, intensity, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-               ->execute([$workout_id, $exercise_id, $set_number, $set_type, $weight_kg, $reps, $rpe, $duration, $distance, $added_weight_kg, $hr_avg, $hr_max, $intensity, $notes]);
-            $set_id = (int)$db->lastInsertId();
+        // Strength/bodyweight sets must include reps.
+        if (!$is_cardio && ($reps === null || $reps <= 0)) {
+            throw new Exception('Reps are required');
         }
 
-        // Read-only PR indicator — does NOT write to DB (PRs are committed on finish_workout)
-        // Used only to show the trophy icon in the workout UI during the session.
+        // Compute is_pr BEFORE insert/update so it can be stored on the row.
+        // For strength: compare new estimated 1RM against both the all-time record AND
+        // the best 1RM already logged in this session. This prevents re-flagging the same
+        // weight in the same session and stops inferior sets from inheriting the PR badge.
         $is_pr   = false;
         $new_prs = [];
         if ($is_cardio) {
-            $avg_speed = ($duration > 0 && $distance > 0) ? round($distance / ($duration / 3600.0), 4) : null;
+            $avg_speed  = ($duration > 0 && $distance > 0) ? round($distance / ($duration / 3600.0), 4) : null;
             $efficiency = ($avg_speed !== null && $hr_avg > 0) ? round($avg_speed / $hr_avg * 1000, 4) : null;
             $metrics = array_filter([
                 'avg_speed'          => $avg_speed,
@@ -298,11 +296,40 @@ try {
         } elseif ($set_type === 'working' && $weight_kg !== null && $reps !== null) {
             $new_1rm = estimate_1rm($weight_kg, $reps, 'epley');
             if ($new_1rm !== null) {
+                // All-time record
                 $chk = $db->prepare("SELECT estimated_1rm FROM personal_records WHERE exercise_id=? ORDER BY estimated_1rm DESC LIMIT 1");
                 $chk->execute([$exercise_id]);
-                $curr = $chk->fetchColumn();
-                $is_pr = ($curr === false || $new_1rm > (float)$curr);
+                $all_time_pr = $chk->fetchColumn();
+
+                // Best estimated 1RM already saved in the current session (excluding this set).
+                // $set_id is 0 for new inserts (so id != 0 excludes nothing — the new row
+                // isn't in the DB yet). For updates, $set_id excludes the current row.
+                $chk2 = $db->prepare("
+                    SELECT MAX(weight_kg * (1.0 + reps / 30.0))
+                    FROM workout_sets
+                    WHERE exercise_id = ? AND workout_id = ? AND id != ?
+                      AND set_type = 'working'
+                      AND weight_kg IS NOT NULL AND reps IS NOT NULL
+                      AND reps > 1 AND reps <= 12
+                ");
+                $chk2->execute([$exercise_id, $workout_id, $set_id ?: 0]);
+                $session_best = $chk2->fetchColumn();
+
+                $all_time  = $all_time_pr !== false ? (float)$all_time_pr : 0.0;
+                $in_session = ($session_best !== false && $session_best !== null) ? (float)$session_best : 0.0;
+                $best = max($all_time, $in_session);
+                $is_pr = ($best == 0.0 || $new_1rm > $best);
             }
+        }
+
+        $pr_int = $is_pr ? 1 : 0;
+        if ($set_id) {
+            $db->prepare("UPDATE workout_sets SET set_number=?, set_type=?, weight_kg=?, reps=?, rpe=?, duration_sec=?, distance_km=?, added_weight_kg=?, hr_avg=?, hr_max=?, intensity=?, notes=?, is_pr=? WHERE id=? AND workout_id=?")
+               ->execute([$set_number, $set_type, $weight_kg, $reps, $rpe, $duration, $distance, $added_weight_kg, $hr_avg, $hr_max, $intensity, $notes, $pr_int, $set_id, $workout_id]);
+        } else {
+            $db->prepare("INSERT INTO workout_sets (workout_id, exercise_id, set_number, set_type, weight_kg, reps, rpe, duration_sec, distance_km, added_weight_kg, hr_avg, hr_max, intensity, notes, is_pr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+               ->execute([$workout_id, $exercise_id, $set_number, $set_type, $weight_kg, $reps, $rpe, $duration, $distance, $added_weight_kg, $hr_avg, $hr_max, $intensity, $notes, $pr_int]);
+            $set_id = (int)$db->lastInsertId();
         }
 
         $row = $db->prepare("SELECT * FROM workout_sets WHERE id = ?");
@@ -313,9 +340,23 @@ try {
         $workout_id  = (int)($_POST['workout_id']  ?? 0);
         $exercise_id = (int)($_POST['exercise_id'] ?? 0);
         $order_num   = (int)($_POST['order_num']   ?? 0);
+        $target_sets = max(1, (int)($_POST['target_sets'] ?? 3));
         if (!$workout_id || !$exercise_id) throw new Exception('workout_id and exercise_id required');
-        $db->prepare("INSERT OR IGNORE INTO workout_exercises (workout_id, exercise_id, order_num) VALUES (?, ?, ?)")
-           ->execute([$workout_id, $exercise_id, $order_num]);
+        $db->prepare("
+            INSERT INTO workout_exercises (workout_id, exercise_id, order_num, target_sets)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(workout_id, exercise_id)
+            DO UPDATE SET order_num=excluded.order_num, target_sets=COALESCE(workout_exercises.target_sets, excluded.target_sets)
+        ")->execute([$workout_id, $exercise_id, $order_num, $target_sets]);
+        echo json_encode(['status' => 'success']);
+
+    } elseif ($action === 'update_workout_exercise_target_sets') {
+        $workout_id  = (int)($_POST['workout_id']  ?? 0);
+        $exercise_id = (int)($_POST['exercise_id'] ?? 0);
+        $target_sets = max(1, (int)($_POST['target_sets'] ?? 3));
+        if (!$workout_id || !$exercise_id) throw new Exception('workout_id and exercise_id required');
+        $db->prepare("UPDATE workout_exercises SET target_sets=? WHERE workout_id=? AND exercise_id=?")
+           ->execute([$target_sets, $workout_id, $exercise_id]);
         echo json_encode(['status' => 'success']);
 
     } elseif ($action === 'remove_workout_exercise') {
@@ -387,6 +428,13 @@ try {
     } elseif ($action === 'delete_template') {
         $id = (int)($_POST['id'] ?? 0);
         if (!$id) throw new Exception('ID required');
+        $active_use = $db->prepare("SELECT COUNT(*) FROM workouts WHERE template_id = ? AND finished_at IS NULL");
+        $active_use->execute([$id]);
+        if ((int)$active_use->fetchColumn() > 0) {
+            throw new Exception('Finish/cancel the active workout using this template first');
+        }
+        // Keep historical workouts intact: detach template references first.
+        $db->prepare("UPDATE workouts SET template_id = NULL WHERE template_id = ?")->execute([$id]);
         $db->prepare("DELETE FROM templates WHERE id=?")->execute([$id]);
         echo json_encode(['status' => 'success']);
 

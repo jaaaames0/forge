@@ -33,7 +33,7 @@ if ($active) {
     // Primary source: workout_exercises (persists even when no sets logged)
     $stmt = $db->prepare("
         SELECT e.id as exercise_id, e.name as exercise_name, e.category,
-               e.muscle_primary, e.bw_factor, e.rest_category, we.order_num
+               e.muscle_primary, e.bw_factor, e.rest_category, we.order_num, we.target_sets
         FROM workout_exercises we
         JOIN exercises e ON e.id = we.exercise_id
         WHERE we.workout_id = ?
@@ -51,7 +51,7 @@ if ($active) {
             'rest_category'  => $row['rest_category'],
             'sets'           => [],
             'prev'           => [],
-            'target_sets'    => 3,
+            'target_sets'    => (int)($row['target_sets'] ?? 3),
         ];
     }
 
@@ -79,8 +79,8 @@ if ($active) {
                 'prev'           => [],
                 'target_sets'    => 3,
             ];
-            $db->prepare("INSERT OR IGNORE INTO workout_exercises (workout_id, exercise_id, order_num) VALUES (?,?,?)")
-               ->execute([$active['id'], $eid, count($exercises)]);
+            $db->prepare("INSERT OR IGNORE INTO workout_exercises (workout_id, exercise_id, order_num, target_sets) VALUES (?,?,?,?)")
+               ->execute([$active['id'], $eid, count($exercises), 3]);
         }
         $exercises[$eid]['sets'][] = $s;
     }
@@ -108,9 +108,10 @@ if ($active) {
         ");
         $stmt->execute([$active['template_id'], $use_ab]);
         $order = 0;
-        $ins   = $db->prepare("INSERT OR IGNORE INTO workout_exercises (workout_id, exercise_id, order_num) VALUES (?,?,?)");
+        $ins   = $db->prepare("INSERT OR IGNORE INTO workout_exercises (workout_id, exercise_id, order_num, target_sets) VALUES (?,?,?,?)");
         foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $te) {
             $eid = (int)$te['exercise_id'];
+            $targetSets = (int)($te['target_sets'] ?? 3);
             $exercises[$eid] = [
                 'exercise_id'    => $eid,
                 'exercise_name'  => $te['exercise_name'],
@@ -120,9 +121,9 @@ if ($active) {
                 'rest_category'  => $te['rest_category'],
                 'sets'           => [],
                 'prev'           => [],
-                'target_sets'    => (int)($te['target_sets'] ?? 3),
+                'target_sets'    => $targetSets,
             ];
-            $ins->execute([$active['id'], $eid, $order++]);
+            $ins->execute([$active['id'], $eid, $order++, $targetSets > 0 ? $targetSets : 3]);
         }
 
         // Record which variant was used so next time we flip it
@@ -145,7 +146,11 @@ if ($active) {
         foreach ($te_stmt->fetchAll(PDO::FETCH_ASSOC) as $te_row) {
             $eid = (int)$te_row['exercise_id'];
             if (isset($exercises[$eid])) {
+                $existingTarget = (int)($exercises[$eid]['target_sets'] ?? 0);
                 $exercises[$eid] = array_merge($exercises[$eid], $te_row);
+                if ($existingTarget > 0) {
+                    $exercises[$eid]['target_sets'] = $existingTarget;
+                }
             }
         }
     }
@@ -258,6 +263,10 @@ include __DIR__ . '/../core/page_head.php';
                 </div>
                 <div class="d-flex align-items-center gap-2 flex-shrink-0">
                     <i class="bi bi-pencil edit-mode-icon d-none" style="font-size:0.85rem;color:#FF5722;"></i>
+                    <i class="bi bi-trash edit-mode-delete d-none"
+                       data-delete-template-id="<?= (int)$t['id'] ?>"
+                       title="Delete template"
+                       style="font-size:0.85rem;color:#ef5350;cursor:pointer;"></i>
                     <span class="text-accent fw-black" style="font-size:1rem;"><?= $t['exercise_count'] ?></span><span class="text-muted" style="font-size:0.75rem;font-weight:400;"> ex</span>
                 </div>
             </button>
@@ -373,6 +382,7 @@ include __DIR__ . '/../core/page_head.php';
          data-bw-factor="<?= $bwFactor ?>"
          data-category="<?= htmlspecialchars($ex['category']) ?>"
          data-rest-category="<?= htmlspecialchars($ex['rest_category'] ?? '') ?>"
+         data-target-sets="<?= (int)$ex['target_sets'] ?>"
          data-prev='<?= $prevJson ?>'>
         <div class="card">
             <div class="card-body pb-2">
@@ -433,7 +443,7 @@ include __DIR__ . '/../core/page_head.php';
                         $prevTxt = $mkPrev($p);
                         $stype  = htmlspecialchars($s['set_type']);
                     ?>
-                    <tr class="set-row ticked" data-set-id="<?= $s['id'] ?>" data-set-num="<?= $setNum ?>" data-set-type="<?= $stype ?>">
+                    <tr class="set-row ticked<?= $s['is_pr'] ? ' pr-flash' : '' ?>" data-set-id="<?= $s['id'] ?>" data-set-num="<?= $setNum ?>" data-set-type="<?= $stype ?>">
                         <?php if ($exType !== 'cardio'): ?>
                         <td class="set-num-cell"><span class="set-num" style="font-weight:900;font-size:.9rem;color:#888;"><?= $setNum ?></span></td>
                         <?php endif; ?>
@@ -452,7 +462,11 @@ include __DIR__ . '/../core/page_head.php';
                         <td><input type="number" class="input-set rpe-input"    inputmode="decimal" value="<?= $s['rpe'] ?? '' ?>" step="0.5" min="6" max="10" disabled></td>
                         <?php endif; ?>
                         <td><button class="btn-tick btn-icon" onclick="tickSet(this)" type="button">
+                            <?php if ($s['is_pr']): ?>
+                            <i class="bi bi-trophy-fill" style="font-size:1.3rem; color:#FF5722;" title="PR!"></i>
+                            <?php else: ?>
                             <i class="bi bi-check-circle-fill" style="font-size:1.4rem;color:#4caf50;"></i>
+                            <?php endif; ?>
                         </button></td>
                     </tr>
                     <?php endforeach; ?>
@@ -660,6 +674,21 @@ async function api(action, data = {}) {
     return r.json();
 }
 
+function syncExerciseTargetSets(block) {
+    if (!block) return;
+    const exerciseId = parseInt(block.dataset.exerciseId || '0', 10);
+    if (!exerciseId) return;
+    const rows = block.querySelectorAll('.set-row').length;
+    const targetSets = Math.max(1, rows);
+    block.dataset.targetSets = String(targetSets);
+    api('update_workout_exercise_target_sets', {
+        workout_id: WORKOUT_ID,
+        exercise_id: exerciseId,
+        target_sets: targetSets,
+    });
+    updateBarNextUp();
+}
+
 // -------------------------------------------------------
 // Workout duration timer
 // -------------------------------------------------------
@@ -803,6 +832,12 @@ async function tickSet(btn) {
             setTimeout(() => { wInput.style.borderColor = ''; rInput.style.borderColor = ''; }, 1500);
             return;
         }
+        if (reps === null || Number.isNaN(reps) || reps <= 0) {
+            rInput.style.borderColor = '#ff4444';
+            setTimeout(() => { rInput.style.borderColor = ''; }, 1500);
+            rInput.focus();
+            return;
+        }
         // For bodyweight exercises weight_kg = added kg (server computes effective)
         payload.weight_kg = weight ?? '';
         payload.reps      = reps ?? '';
@@ -832,6 +867,62 @@ async function tickSet(btn) {
         const restCat  = block.dataset.restCategory || '';
         const restSecs = REST_TIMES[restCat] ?? REST_DEFAULT;
         startRestTimer(restSecs);
+    }
+
+    updateBarNextUp();
+}
+
+// Update the bar's "next up" label live after each set tick (no page reload needed).
+function updateBarNextUp() {
+    const labelEl = document.getElementById('ab-next-label');
+    const nameEl  = document.getElementById('ab-next-name');
+    if (!labelEl || !nameEl) return;
+
+    const blocks = [...document.querySelectorAll('.exercise-block')];
+    if (!blocks.length) return;
+
+    // Find exercise with most recently saved ticked set (highest numeric set-id)
+    let lastBlock  = null;
+    let highestId  = -1;
+    blocks.forEach(block => {
+        block.querySelectorAll('.set-row.ticked').forEach(row => {
+            const sid = parseInt(row.dataset.setId || '0');
+            if (sid > highestId) { highestId = sid; lastBlock = block; }
+        });
+    });
+
+    if (!lastBlock) return;
+
+    const tickedCount = lastBlock.querySelectorAll('.set-row.ticked').length;
+    const targetSets  = parseInt(lastBlock.dataset.targetSets || '3');
+    const name = lastBlock.querySelector('a.fw-black, span.fw-black')?.textContent?.trim() || '';
+
+    if (tickedCount < targetSets) {
+        labelEl.style.color = '#FF5722';
+        labelEl.textContent = `NEXT UP · SET ${tickedCount + 1} OF ${targetSets}`;
+        nameEl.textContent  = name;
+    } else {
+        // Try to find the next exercise block with remaining sets
+        const currentIdx = blocks.indexOf(lastBlock);
+        let found = false;
+        for (let i = currentIdx + 1; i < blocks.length; i++) {
+            const b  = blocks[i];
+            const bt = b.querySelectorAll('.set-row.ticked').length;
+            const bs = parseInt(b.dataset.targetSets || b.querySelectorAll('.set-row').length.toString() || '3');
+            if (bt < bs) {
+                const bn = b.querySelector('a.fw-black, span.fw-black')?.textContent?.trim() || '';
+                labelEl.style.color = '#FF5722';
+                labelEl.textContent = `NEXT UP · SET ${bt + 1} OF ${bs}`;
+                nameEl.textContent  = bn;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            labelEl.style.color = '#4caf50';
+            labelEl.textContent = 'ALL SETS DONE';
+            nameEl.textContent  = 'Finish workout?';
+        }
     }
 }
 
@@ -891,6 +982,7 @@ function addSet(exerciseId) {
         tbody.appendChild(row);
         row.querySelector('.weight-input').focus();
     }
+    syncExerciseTargetSets(block);
 }
 
 function addDropSet(exerciseId) {
@@ -939,6 +1031,7 @@ function addDropSet(exerciseId) {
     setupLongPress(row);
     tbody.appendChild(row);
     row.querySelector('.weight-input').focus();
+    syncExerciseTargetSets(block);
 }
 
 async function deleteLastSet(exerciseId) {
@@ -1039,6 +1132,7 @@ function recalcWarmup(exerciseId) {
 
 async function deleteSetRow(row) {
     const setId = row.dataset.setId;
+    const block = row.closest('.exercise-block');
     if (setId) {
         await api('delete_set', { set_id: setId, workout_id: WORKOUT_ID });
     }
@@ -1050,12 +1144,16 @@ async function deleteSetRow(row) {
         const n = r.querySelector('.set-num');
         if (n) n.textContent = i + 1;
     });
+    syncExerciseTargetSets(block);
 }
 
 function setupLongPress(row) {
     let timer = null;
     const LONG_MS = 600;
-    const start = () => { timer = setTimeout(() => confirmDeleteRow(row), LONG_MS); };
+    const start = (e) => {
+        if (e.target.closest('input, select, textarea')) return;
+        timer = setTimeout(() => confirmDeleteRow(row), LONG_MS);
+    };
     const cancel = () => clearTimeout(timer);
     row.addEventListener('touchstart', start, { passive: true });
     row.addEventListener('touchend',   cancel);
@@ -1212,6 +1310,7 @@ function addExerciseBlock(ex) {
     block.dataset.exType       = exType;
     block.dataset.category     = ex.category || '';
     block.dataset.restCategory = ex.rest_category || '';
+    block.dataset.targetSets   = 3;
     if (bwFactor !== null) block.dataset.bwFactor = bwFactor;
 
     block.innerHTML = `
@@ -1257,7 +1356,7 @@ function addExerciseBlock(ex) {
     document.getElementById('exercise-blocks').appendChild(block);
 
     const orderNum = document.querySelectorAll('.exercise-block').length - 1;
-    api('add_workout_exercise', { workout_id: WORKOUT_ID, exercise_id: ex.id, order_num: orderNum });
+    api('add_workout_exercise', { workout_id: WORKOUT_ID, exercise_id: ex.id, order_num: orderNum, target_sets: 3 });
 
     api('get_last_exercise_sets', { exercise_id: ex.id, workout_id: WORKOUT_ID })
         .then(r => {
@@ -1329,6 +1428,7 @@ function toggleEditMode() {
     btn.style.color       = editMode ? '#FF5722' : '#666';
     btn.style.borderColor = editMode ? '#FF5722' : '#333';
     document.querySelectorAll('.edit-mode-icon').forEach(el => el.classList.toggle('d-none', !editMode));
+    document.querySelectorAll('.edit-mode-delete').forEach(el => el.classList.toggle('d-none', !editMode));
 }
 
 document.querySelectorAll('.template-form').forEach(form => {
@@ -1336,6 +1436,31 @@ document.querySelectorAll('.template-form').forEach(form => {
         if (editMode) {
             e.preventDefault();
             window.location.href = '/forge/templates/?id=' + this.dataset.templateId;
+        }
+    });
+});
+
+document.querySelectorAll('.edit-mode-delete').forEach(icon => {
+    icon.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!editMode) return;
+        const templateId = parseInt(icon.dataset.deleteTemplateId || '0', 10);
+        if (!templateId) return;
+        if (!confirm('Delete this template? Past workouts stay in history.')) return;
+
+        const fd = new FormData();
+        fd.append('action', 'delete_template');
+        fd.append('id', String(templateId));
+        const r = await fetch('/forge/core/api.php', { method: 'POST', body: fd }).then(res => res.json());
+        if (r.status === 'success') {
+            icon.closest('.template-form')?.remove();
+            if (!document.querySelector('.template-form')) {
+                const list = document.getElementById('template-list');
+                if (list) list.innerHTML = '<div class="text-muted small text-center py-3" style="color:#444;">No templates yet</div>';
+            }
+        } else {
+            alert('Error: ' + (r.message || 'Failed to delete template'));
         }
     });
 });

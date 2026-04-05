@@ -2,6 +2,8 @@
 
 Self-hosted gym and workout tracking web app. Built for personal use on a phone at the gym. Sister app to [SPENCE](../spence/).
 
+Current release: **v0.2.0**.
+
 ![PHP](https://img.shields.io/badge/PHP-8.2+-777BB4?logo=php&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-3-003B57?logo=sqlite&logoColor=white)
 ![Bootstrap](https://img.shields.io/badge/Bootstrap-5.3-7952B3?logo=bootstrap&logoColor=white)
@@ -10,8 +12,11 @@ Self-hosted gym and workout tracking web app. Built for personal use on a phone 
 
 - Log workouts from templates with set-by-set tracking (weight, reps, RPE)
 - Rest timer that persists when navigating between pages
+- Optional rest alerts: in-app bell + background system notification
 - Progression suggestions (linear, double progression, RPE-based)
 - e1RM tracking and personal record detection
+- Session PR highlights (trophy on PR sets)
+- Dynamic active workout bar with "next up" guidance
 - Exercise stats: best sets, estimated 1RM history, volume trends
 - Full session history per exercise
 - Body composition tracking (waist/neck/hip measurements, Navy BF% formula)
@@ -107,20 +112,23 @@ templates/      Template builder
 exercises/      Exercise library + individual stats
 history/        Session history + per-exercise history
 progress/       e1RM trends, volume, body comp, cardio PRs
-profile/        User settings (bodyweight, height, units)
-settings/       App settings (rest timer, 1RM formula)
+profile/        User profile + body metrics + rest alert toggles
+settings/       Reserved for future app-level settings
+sw.js           Service worker for background rest notifications
 database/       schema.sql, forge_empty.db (forge.db is gitignored)
 ```
 
 ## Configuration
 
-Settings stored in `user_settings` table, editable via the Settings page:
+Settings stored in `user_settings` table. Common keys currently used:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `unit` | `kg` | Weight unit |
-| `rest_timer_sec` | `90` | Default rest timer duration |
-| `1rm_formula` | `epley` | 1RM estimation formula |
+| `bodyweight_kg` | `70` | Used for bodyweight exercise effective-load calculations |
+| `rest_compound_big4_sec` | `300` | Rest timer for squat/bench/deadlift/OHP tier |
+| `rest_compound_sec` | `240` | Rest timer for compound lifts |
+| `rest_bodyweight_sec` | `180` | Rest timer for bodyweight exercises |
+| `rest_isolation_sec` | `120` | Rest timer for isolation exercises |
 
 ## Gitignored files
 

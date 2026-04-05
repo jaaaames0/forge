@@ -98,8 +98,13 @@ function maybe_migrate_schema(PDO $db): void {
         workout_id  INTEGER NOT NULL REFERENCES workouts(id) ON DELETE CASCADE,
         exercise_id INTEGER NOT NULL REFERENCES exercises(id),
         order_num   INTEGER DEFAULT 0,
+        target_sets INTEGER DEFAULT 3,
         UNIQUE(workout_id, exercise_id)
     )");
+    $we_cols = array_column($db->query("PRAGMA table_info(workout_exercises)")->fetchAll(PDO::FETCH_ASSOC), 'name');
+    if (!in_array('target_sets', $we_cols)) {
+        $db->exec("ALTER TABLE workout_exercises ADD COLUMN target_sets INTEGER DEFAULT 3");
+    }
 
     // cardio_records table
     $db->exec("CREATE TABLE IF NOT EXISTS cardio_records (
@@ -122,6 +127,12 @@ function maybe_migrate_schema(PDO $db): void {
     }
     if (!in_array('last_ab_variant', $tpl_cols)) {
         $db->exec("ALTER TABLE templates ADD COLUMN last_ab_variant TEXT DEFAULT NULL");
+    }
+
+    // workout_sets.is_pr flag (persisted so PR highlights survive page return)
+    $ws_cols = array_column($db->query("PRAGMA table_info(workout_sets)")->fetchAll(PDO::FETCH_ASSOC), 'name');
+    if (!in_array('is_pr', $ws_cols)) {
+        $db->exec("ALTER TABLE workout_sets ADD COLUMN is_pr INTEGER NOT NULL DEFAULT 0");
     }
 
     // body_measurements table

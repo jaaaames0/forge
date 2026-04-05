@@ -19,7 +19,7 @@ $next_template = $db->query("
     LEFT JOIN template_exercises te ON te.template_id = t.id
     LEFT JOIN workouts w ON w.template_id = t.id AND w.finished_at IS NOT NULL
     GROUP BY t.id
-    ORDER BY use_count DESC, last_used ASC
+    ORDER BY COALESCE(MAX(w.finished_at), '1970-01-01') ASC, use_count DESC
     LIMIT 1
 ")->fetch(PDO::FETCH_ASSOC);
 

@@ -21,7 +21,7 @@ $_ab_all_done = false;
 
 $_ab_prog = $db->prepare("
     SELECT we.exercise_id, e.name as exercise_name,
-           COALESCE(te.target_sets, 3) as target_sets,
+           COALESCE(we.target_sets, te.target_sets, 3) as target_sets,
            te.target_reps_min, te.target_reps_max,
            COUNT(ws.id)  as logged_sets,
            MAX(ws.id)    as last_set_id,
@@ -83,8 +83,8 @@ if (!empty($_ab_rows)) {
   <!-- Left: next-up exercise info -->
   <div style="min-width:0; flex-shrink:1; overflow:hidden;">
     <?php if ($_ab_all_done): ?>
-      <div style="font-size:0.52rem; font-weight:900; color:#4caf50; text-transform:uppercase; letter-spacing:0.5px; line-height:1;">ALL SETS DONE</div>
-      <div style="font-size:0.8rem; font-weight:900; color:#e0e0e0; line-height:1.2;">Finish workout?</div>
+      <div id="ab-next-label" style="font-size:0.52rem; font-weight:900; color:#4caf50; text-transform:uppercase; letter-spacing:0.5px; line-height:1;">ALL SETS DONE</div>
+      <div id="ab-next-name"  style="font-size:0.8rem; font-weight:900; color:#e0e0e0; line-height:1.2;">Finish workout?</div>
     <?php elseif ($_ab_next):
         $_ab_reps_min = (int)($_ab_next['target_reps_min'] ?? 0);
         $_ab_reps_max = (int)($_ab_next['target_reps_max'] ?? 0);
@@ -96,13 +96,13 @@ if (!empty($_ab_rows)) {
         $_ab_weight_str = $_ab_next['current_weight'] ? $_ab_next['current_weight'].' kg' : '';
         $_ab_detail = trim(implode('  ', array_filter([$_ab_weight_str, $_ab_reps_str])));
     ?>
-      <div style="font-size:0.52rem; font-weight:900; color:#FF5722; text-transform:uppercase; letter-spacing:0.5px; line-height:1;">NEXT UP · SET <?= $_ab_next['set_num'] ?> OF <?= (int)$_ab_next['target_sets'] ?></div>
-      <div style="font-size:0.8rem; font-weight:900; color:#e0e0e0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; line-height:1.2;">
+      <div id="ab-next-label" style="font-size:0.52rem; font-weight:900; color:#FF5722; text-transform:uppercase; letter-spacing:0.5px; line-height:1;">NEXT UP · SET <?= $_ab_next['set_num'] ?> OF <?= (int)$_ab_next['target_sets'] ?></div>
+      <div id="ab-next-name"  style="font-size:0.8rem; font-weight:900; color:#e0e0e0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; line-height:1.2;">
         <?= htmlspecialchars($_ab_next['exercise_name']) ?><?php if ($_ab_detail): ?><span style="color:#888; font-weight:400; font-size:0.72rem; margin-left:6px;"><?= htmlspecialchars($_ab_detail) ?></span><?php endif; ?>
       </div>
     <?php else: ?>
-      <div style="font-size:0.52rem; font-weight:900; color:#FF5722; text-transform:uppercase; letter-spacing:0.5px; line-height:1;">ACTIVE</div>
-      <div style="font-size:0.8rem; font-weight:900; color:#e0e0e0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; line-height:1.2;"><?= htmlspecialchars($_ab_wkt['name'] ?: 'Workout') ?></div>
+      <div id="ab-next-label" style="font-size:0.52rem; font-weight:900; color:#FF5722; text-transform:uppercase; letter-spacing:0.5px; line-height:1;">ACTIVE</div>
+      <div id="ab-next-name"  style="font-size:0.8rem; font-weight:900; color:#e0e0e0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; line-height:1.2;"><?= htmlspecialchars($_ab_wkt['name'] ?: 'Workout') ?></div>
     <?php endif; ?>
     <div id="ab-elapsed" style="font-size:0.62rem; color:#666; font-weight:700; line-height:1.2;"></div>
   </div>
@@ -152,6 +152,88 @@ if (!empty($_ab_rows)) {
         return m + ':' + String(s).padStart(2, '0');
     }
 
+    // ── Service Worker + rest-alert preferences ──────────────────────────────
+    const NOTIF_KEY = 'forge_notify_rest';
+    const SOUND_KEY = 'forge_sound_rest';
+    let swReg = null;
+
+    // Default bell to ON for existing users.
+    if (localStorage.getItem(SOUND_KEY) === null) localStorage.setItem(SOUND_KEY, '1');
+
+    function soundEnabled() {
+        return localStorage.getItem(SOUND_KEY) !== '0';
+    }
+    function notificationSupported() {
+        return 'Notification' in window;
+    }
+    function notificationGranted() {
+        return notificationSupported() && Notification.permission === 'granted';
+    }
+    function notifyEnabled() {
+        return localStorage.getItem(NOTIF_KEY) === '1' && notificationGranted();
+    }
+
+    function swPost(msg) {
+        if (!('serviceWorker' in navigator)) return;
+        if (swReg && swReg.active) {
+            swReg.active.postMessage(msg);
+            return;
+        }
+        navigator.serviceWorker.ready
+            .then(reg => { if (reg.active) reg.active.postMessage(msg); })
+            .catch(() => {});
+    }
+
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/forge/sw.js', { scope: '/forge/' })
+            .then(reg => { swReg = reg; })
+            .catch(() => {});
+    }
+
+    async function notifyRestDone() {
+        if (!notifyEnabled()) return;
+        const pageVisible = document.visibilityState === 'visible' && (typeof document.hasFocus !== 'function' || document.hasFocus());
+        if (pageVisible) return;
+        try {
+            if ('serviceWorker' in navigator) {
+                const reg = swReg || await navigator.serviceWorker.ready;
+                await reg.showNotification('FORGE — Rest done', {
+                    body: 'Time to lift.',
+                    icon: '/forge/core/favicon.svg',
+                    badge: '/forge/core/favicon.svg',
+                    tag: 'forge-rest-timer',
+                    renotify: true,
+                    data: { url: '/forge/workout/' },
+                    actions: [{ action: 'open', title: 'Back to workout' }],
+                });
+            } else if (notificationGranted()) {
+                new Notification('FORGE — Rest done', { body: 'Time to lift.' });
+            }
+        } catch (e) {}
+    }
+
+    // ── Audio bell ──────────────────────────────────────────────────────────
+    function playBell() {
+        if (!soundEnabled()) return;
+        try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            // Two-tone bell: fundamental + overtone, quick decay
+            [523.25, 1046.5].forEach((freq, i) => {
+                const osc  = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.type = 'sine';
+                osc.frequency.value = freq;
+                gain.gain.setValueAtTime(i === 0 ? 0.5 : 0.25, ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 1.8);
+                osc.start(ctx.currentTime);
+                osc.stop(ctx.currentTime + 1.8);
+            });
+        } catch (e) {}
+    }
+
+    // ── Timer UI (existing logic, extended) ─────────────────────────────────
     function startTimerUI(endMs) {
         clearInterval(_iv);
         timerEl.style.display = '';
@@ -166,7 +248,10 @@ if (!empty($_ab_rows)) {
                 btnsEl.style.display = 'none';
                 document.body.classList.remove('workout-bar-timer');
                 localStorage.removeItem(TIMER_KEY);
+                swPost({ type: 'CANCEL_TIMER' });
                 navigator.vibrate && navigator.vibrate([200, 100, 200]);
+                playBell();
+                notifyRestDone();
             }
         }
         tick();
@@ -178,6 +263,7 @@ if (!empty($_ab_rows)) {
         const endMs = Date.now() + seconds * 1000;
         localStorage.setItem(TIMER_KEY, endMs);
         startTimerUI(endMs);
+        if (notifyEnabled()) swPost({ type: 'SET_TIMER', endMs });
     };
     window.skipRest = function() {
         clearInterval(_iv);
@@ -185,6 +271,7 @@ if (!empty($_ab_rows)) {
         timerEl.style.display = 'none';
         btnsEl.style.display = 'none';
         document.body.classList.remove('workout-bar-timer');
+        swPost({ type: 'CANCEL_TIMER' });
     };
     window.addRestTime = function(sec) {
         const cur = parseInt(localStorage.getItem(TIMER_KEY) || '0');
@@ -192,10 +279,51 @@ if (!empty($_ab_rows)) {
         localStorage.setItem(TIMER_KEY, newEnd);
         clearInterval(_iv);
         startTimerUI(newEnd);
+        if (notifyEnabled()) swPost({ type: 'SET_TIMER', endMs: newEnd });
+    };
+
+    // Expose toggle for the exercises settings modal
+    window.forgeToggleNotifications = async function(enable) {
+        if (enable) {
+            if (!notificationSupported()) return false;
+            if (Notification.permission === 'default') {
+                const result = await Notification.requestPermission();
+                if (result !== 'granted') {
+                    // Permission denied — update toggle state back
+                    const toggle = document.getElementById('notif-toggle');
+                    if (toggle) toggle.checked = false;
+                    return false;
+                }
+            }
+            if (notificationGranted()) {
+                localStorage.setItem(NOTIF_KEY, '1');
+                const saved = parseInt(localStorage.getItem(TIMER_KEY) || '0');
+                if (saved > Date.now()) swPost({ type: 'SET_TIMER', endMs: saved });
+                return true;
+            }
+        } else {
+            localStorage.removeItem(NOTIF_KEY);
+            swPost({ type: 'CANCEL_TIMER' });
+            return true;
+        }
+        return false;
+    };
+    window.forgeSetRestSound = function(enable) {
+        localStorage.setItem(SOUND_KEY, enable ? '1' : '0');
+    };
+    window.forgeGetRestPrefs = function() {
+        return {
+            sound: soundEnabled(),
+            notifications: localStorage.getItem(NOTIF_KEY) === '1',
+            permission: notificationSupported() ? Notification.permission : 'unsupported',
+        };
     };
 
     // Resume timer if page loaded mid-rest
     const saved = parseInt(localStorage.getItem(TIMER_KEY) || '0');
-    if (saved > Date.now()) startTimerUI(saved);
+    if (saved > Date.now()) {
+        startTimerUI(saved);
+        if (notifyEnabled()) swPost({ type: 'SET_TIMER', endMs: saved });
+    }
 })();
 </script>

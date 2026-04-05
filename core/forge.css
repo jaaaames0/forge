@@ -56,6 +56,16 @@ body { background-color: #121212; color: #e0e0e0; font-family: 'Inter', sans-ser
 .forge-nav-link:hover  { color: #fff !important; }
 .forge-nav-link.active { color: #FF5722 !important; border-bottom-color: #FF5722; }
 
+/* Mobile nav: no underline on stacked icon+label items */
+@media (max-width: 991.98px) {
+    .forge-nav-link.active { border-bottom-color: transparent; }
+}
+
+/* Workout logger uses its own sticky sub-header; remove the default nav gap there. */
+[data-context="workout"] .navbar.sticky-top {
+    margin-bottom: 0 !important;
+}
+
 /* Per-context accent overrides — currently all use #FF5722 */
 [data-context="workout"]   .forge-nav-link.active { color: #FF5722 !important; border-bottom-color: #FF5722; }
 [data-context="progress"]  .forge-nav-link.active { color: #FF5722 !important; border-bottom-color: #FF5722; }

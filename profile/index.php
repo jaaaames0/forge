@@ -266,6 +266,36 @@ include __DIR__ . '/../core/page_head.php';
     </div>
     <?php endif; ?>
 
+    <!-- ── REST ALERTS ─────────────────────────────────────────────────── -->
+    <div class="stat-label mb-2">REST ALERTS</div>
+    <div class="card mb-3">
+        <div class="card-body">
+            <div class="d-flex align-items-center justify-content-between mb-2">
+                <div>
+                    <div class="stat-label" style="font-size:0.62rem;">BELL SOUND</div>
+                    <div class="text-muted" style="font-size:0.68rem;">Play alert tone when rest hits zero</div>
+                </div>
+                <div class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch" id="bell-toggle"
+                           style="width:2.5em;height:1.4em;cursor:pointer;accent-color:#FF5722;"
+                           onchange="setBellToggle(this.checked)">
+                </div>
+            </div>
+            <div class="d-flex align-items-center justify-content-between">
+                <div>
+                    <div class="stat-label" style="font-size:0.62rem;">SYSTEM NOTIFICATION</div>
+                    <div class="text-muted" style="font-size:0.68rem;">Popup you can tap to return to workout</div>
+                </div>
+                <div class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch" id="profile-notif-toggle"
+                           style="width:2.5em;height:1.4em;cursor:pointer;accent-color:#FF5722;"
+                           onchange="setProfileNotificationToggle(this.checked)">
+                </div>
+            </div>
+            <div id="profile-notif-status" style="font-size:0.65rem;color:#666;margin-top:8px;"></div>
+        </div>
+    </div>
+
     <div class="text-center text-muted mb-4" style="font-size:0.65rem;letter-spacing:1px;">
         FORGE · SELF-HOSTED · <a href="/spence/" style="color:#666;">SPENCE ↗</a>
     </div>
@@ -358,6 +388,81 @@ async function deleteMeasurement(id, btn) {
     if (r.status === 'success') btn.closest('.d-flex').remove();
     else alert(r.message);
 }
+
+function getRestPrefs() {
+    if (typeof window.forgeGetRestPrefs === 'function') return window.forgeGetRestPrefs();
+    const perm = ('Notification' in window) ? Notification.permission : 'unsupported';
+    return {
+        sound: localStorage.getItem('forge_sound_rest') !== '0',
+        notifications: localStorage.getItem('forge_notify_rest') === '1',
+        permission: perm,
+    };
+}
+
+function refreshRestAlertUI() {
+    const prefs = getRestPrefs();
+    const bell = document.getElementById('bell-toggle');
+    const notif = document.getElementById('profile-notif-toggle');
+    const status = document.getElementById('profile-notif-status');
+    if (!bell || !notif || !status) return;
+
+    bell.checked = !!prefs.sound;
+    const enabled = !!prefs.notifications && prefs.permission === 'granted';
+    notif.checked = enabled;
+
+    if (prefs.permission === 'denied') {
+        status.textContent = 'Notifications blocked in browser settings.';
+        status.style.color = '#ef5350';
+        notif.disabled = true;
+    } else if (prefs.permission === 'unsupported') {
+        status.textContent = 'Notifications are not supported in this browser.';
+        status.style.color = '#888';
+        notif.disabled = true;
+    } else {
+        status.textContent = enabled ? 'Enabled.' : '';
+        status.style.color = '#666';
+        notif.disabled = false;
+    }
+}
+
+function setBellToggle(enable) {
+    if (typeof window.forgeSetRestSound === 'function') {
+        window.forgeSetRestSound(enable);
+    } else {
+        localStorage.setItem('forge_sound_rest', enable ? '1' : '0');
+    }
+    refreshRestAlertUI();
+}
+
+async function setProfileNotificationToggle(enable) {
+    let ok = false;
+    if (typeof window.forgeToggleNotifications === 'function') {
+        ok = await window.forgeToggleNotifications(enable);
+    } else {
+        if (!('Notification' in window)) {
+            ok = false;
+        } else if (!enable) {
+            localStorage.removeItem('forge_notify_rest');
+            ok = true;
+        } else {
+            if (Notification.permission === 'default') {
+                const result = await Notification.requestPermission();
+                if (result !== 'granted') ok = false;
+            }
+            if (Notification.permission === 'granted') {
+                localStorage.setItem('forge_notify_rest', '1');
+                ok = true;
+            }
+        }
+    }
+    if (!ok && enable) {
+        const toggle = document.getElementById('profile-notif-toggle');
+        if (toggle) toggle.checked = false;
+    }
+    refreshRestAlertUI();
+}
+
+refreshRestAlertUI();
 </script>
 
 </body>

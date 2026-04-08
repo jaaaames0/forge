@@ -22,7 +22,8 @@ if ($exercise_id) {
         $stmt = $db->prepare("
             SELECT COUNT(DISTINCT ws.workout_id) as session_count,
                    COUNT(ws.id) as set_count,
-                   ROUND(SUM(COALESCE(ws.distance_km, 0)), 2) as total_distance_km
+                   ROUND(SUM(COALESCE(ws.distance_km, 0)), 2) as total_distance_km,
+                   SUM(COALESCE(ws.duration_sec, 0)) as total_duration_sec
             FROM workout_sets ws
             JOIN workouts w ON w.id = ws.workout_id
             WHERE ws.exercise_id = ? AND w.finished_at IS NOT NULL
@@ -81,7 +82,7 @@ if ($exercise_id) {
             $ss = $db->prepare("
                 SELECT ws.set_number, ws.set_type, ws.weight_kg, ws.reps, ws.rpe,
                        CASE WHEN ws.weight_kg > 0 AND ws.reps = 1 THEN ws.weight_kg
-                            WHEN ws.weight_kg > 0 AND ws.reps > 1 AND ws.reps <= 12
+                            WHEN ws.weight_kg > 0 AND ws.reps > 1 AND ws.reps <= 30
                             THEN ROUND(ws.weight_kg * (1 + ws.reps / 30.0), 1)
                             ELSE NULL END as estimated_1rm
                 FROM workout_sets ws
@@ -135,46 +136,35 @@ if ($exercise_id) {
                 <?php endif; ?>
             </div>
         </div>
-        <?php if ($ex['is_custom']): ?>
         <button class="btn-icon" onclick="openEditModal()" type="button"><i class="bi bi-pencil" style="font-size:1rem;"></i></button>
-        <?php endif; ?>
     </div>
 
     <!-- Quick stats — 5 inline cards -->
     <div class="row g-1 mb-4">
-        <div class="col text-center"><div class="card py-2 px-1"><div class="stat-label" style="font-size:0.55rem;">SESSIONS</div><div class="fw-black" style="font-size:1rem;"><?= (int)$stats['session_count'] ?></div></div></div>
+        <div class="col text-center"><div class="card py-2 px-1" style="height:100%;"><div class="stat-label" style="font-size:0.55rem;">SESSIONS</div><div class="fw-black" style="font-size:1rem;"><?= (int)$stats['session_count'] ?></div></div></div>
         <?php if ($is_cardio): ?>
-        <div class="col text-center"><div class="card py-2 px-1"><div class="stat-label" style="font-size:0.55rem;">TOTAL KM</div><div class="fw-black" style="font-size:1rem;"><?= $stats['total_distance_km'] ?: '—' ?></div></div></div>
-        <div class="col text-center"><div class="card py-2 px-1"><div class="stat-label" style="font-size:0.55rem;">BEST SPEED</div><div class="fw-black" style="font-size:0.85rem;"><?= isset($cardio_prs['avg_speed']) ? round($cardio_prs['avg_speed']['value'], 1).' km/h' : '—' ?></div></div></div>
+        <div class="col text-center"><div class="card py-2 px-1" style="height:100%;"><div class="stat-label" style="font-size:0.55rem;">TOTAL KM</div><div class="fw-black" style="font-size:1rem;"><?= $stats['total_distance_km'] ?: '—' ?></div></div></div>
+        <div class="col text-center"><div class="card py-2 px-1" style="height:100%;"><div class="stat-label" style="font-size:0.55rem;">TOTAL TIME</div><div class="fw-black" style="font-size:1rem;"><?= $stats['total_duration_sec'] ? gmdate('H:i', (int)$stats['total_duration_sec']) : '—' ?></div></div></div>
         <?php else: ?>
-        <div class="col text-center"><div class="card py-2 px-1"><div class="stat-label" style="font-size:0.55rem;">SETS</div><div class="fw-black" style="font-size:1rem;"><?= (int)$stats['set_count'] ?></div></div></div>
-        <div class="col text-center"><div class="card py-2 px-1"><div class="stat-label" style="font-size:0.55rem;">BEST VOL</div><div class="fw-black" style="font-size:0.85rem;"><?= $stats['best_set_volume'] ? round($stats['best_set_volume']).' '.$unit : '—' ?></div></div></div>
-        <div class="col text-center"><div class="card py-2 px-1" style="border-color:#2a1a0a;"><div class="stat-label" style="font-size:0.55rem;">e1RM</div><div class="fw-black" style="font-size:0.85rem; color:#FF5722;"><?= $pr ? $pr['estimated_1rm'].' '.$unit : '—' ?></div></div></div>
-        <div class="col text-center"><div class="card py-2 px-1" style="border-color:#2a1a0a;"><div class="stat-label" style="font-size:0.55rem;">5RM</div><div class="fw-black" style="font-size:0.85rem;"><?= $pr ? round($pr['estimated_1rm'] * 6/7, 1).' '.$unit : '—' ?></div></div></div>
+        <div class="col text-center"><div class="card py-2 px-1" style="height:100%;"><div class="stat-label" style="font-size:0.55rem;">SETS</div><div class="fw-black" style="font-size:1rem;"><?= (int)$stats['set_count'] ?></div></div></div>
+        <div class="col text-center"><div class="card py-2 px-1" style="height:100%;"><div class="stat-label" style="font-size:0.55rem;">BEST VOL</div><div class="fw-black" style="font-size:0.85rem;"><?= $stats['best_set_volume'] ? round($stats['best_set_volume']).' '.$unit : '—' ?></div></div></div>
+        <div class="col text-center"><div class="card py-2 px-1" style="height:100%;"><div class="stat-label" style="font-size:0.55rem;">e1RM</div><div class="fw-black" style="font-size:0.85rem; color:#FF5722;"><?= $pr ? $pr['estimated_1rm'].' '.$unit : '—' ?></div></div></div>
+        <div class="col text-center"><div class="card py-2 px-1" style="height:100%;"><div class="stat-label" style="font-size:0.55rem;">5RM</div><div class="fw-black" style="font-size:0.85rem;"><?= $pr ? round($pr['estimated_1rm'] * 6/7, 1).' '.$unit : '—' ?></div></div></div>
         <?php endif; ?>
     </div>
 
-    <!-- Cardio records banner -->
+    <!-- Cardio records -->
     <?php if ($is_cardio && !empty($cardio_prs)): ?>
-    <div class="card mb-4" style="border-left:3px solid #FF5722;">
-        <div class="card-body py-2 px-3">
-            <div class="stat-label mb-2"><i class="bi bi-trophy-fill text-accent me-1"></i>RECORDS</div>
-            <div class="d-flex flex-wrap gap-4">
-                <?php if (isset($cardio_prs['avg_speed'])): ?>
-                <div><div class="stat-label">BEST SPEED</div>
-                     <div class="fw-black" style="font-size:1.2rem; color:#FF5722;"><?= round($cardio_prs['avg_speed']['value'], 2) ?> km/h</div></div>
-                <?php endif; ?>
-                <?php if (isset($cardio_prs['cardiac_efficiency'])): ?>
-                <div><div class="stat-label">EFFICIENCY</div>
-                     <div class="fw-black" style="font-size:1.2rem;"><?= round($cardio_prs['cardiac_efficiency']['value'], 1) ?></div>
-                     <div class="text-muted" style="font-size:0.62rem;">speed ÷ HR × 1000</div></div>
-                <?php endif; ?>
-                <?php if (isset($cardio_prs['best_distance'])): ?>
-                <div><div class="stat-label">BEST DISTANCE</div>
-                     <div class="fw-black" style="font-size:1.2rem;"><?= round($cardio_prs['best_distance']['value'], 2) ?> km</div></div>
-                <?php endif; ?>
-            </div>
-        </div>
+    <div class="row g-1 mb-4">
+        <?php if (isset($cardio_prs['avg_speed'])): ?>
+        <div class="col text-center"><div class="card py-2 px-1" style="height:100%; border-color:#FF5722;"><div class="stat-label" style="font-size:0.55rem;">BEST SPEED</div><div class="fw-black" style="font-size:1rem; color:#FF5722;"><?= round($cardio_prs['avg_speed']['value'], 2) ?> km/h</div></div></div>
+        <?php endif; ?>
+        <?php if (isset($cardio_prs['best_distance'])): ?>
+        <div class="col text-center"><div class="card py-2 px-1" style="height:100%; border-color:#FF5722;"><div class="stat-label" style="font-size:0.55rem;">BEST DISTANCE</div><div class="fw-black" style="font-size:1rem; color:#FF5722;"><?= round($cardio_prs['best_distance']['value'], 2) ?> km</div></div></div>
+        <?php endif; ?>
+        <?php if (isset($cardio_prs['best_duration'])): ?>
+        <div class="col text-center"><div class="card py-2 px-1" style="height:100%; border-color:#FF5722;"><div class="stat-label" style="font-size:0.55rem;">BEST DURATION</div><div class="fw-black" style="font-size:1rem; color:#FF5722;"><?= gmdate('H:i', (int)$cardio_prs['best_duration']['value']) ?></div></div></div>
+        <?php endif; ?>
     </div>
     <?php endif; ?>
 
@@ -259,7 +249,6 @@ if ($exercise_id) {
 
 </div>
 
-<?php if ($ex['is_custom']): ?>
 <!-- Edit Modal -->
 <div class="modal fade" id="editExModal" tabindex="-1">
     <div class="modal-dialog modal-dialog-centered">
@@ -290,6 +279,20 @@ if ($exercise_id) {
                 </div>
                 <div class="mb-3"><label class="stat-label d-block mb-1">SECONDARY MUSCLE</label>
                     <input type="text" id="ex-secondary" class="form-control" value="<?= htmlspecialchars($ex['muscle_secondary'] ?? '') ?>"></div>
+                <div class="mb-3"><label class="stat-label d-block mb-1">REST / WARMUP CATEGORY</label>
+                    <select id="ex-rest-cat" class="form-select">
+                        <option value="">— none —</option>
+                        <?php foreach ([
+                            'compound_big4' => 'Big 4 Compound (squat, deadlift, bench, OHP)',
+                            'compound'      => 'Compound (rows, pull-ups, lunges…)',
+                            'bodyweight'    => 'Bodyweight (push-ups, dips, planks…)',
+                            'isolation'     => 'Isolation (curls, flyes, extensions…)',
+                        ] as $v => $label): ?>
+                        <option value="<?= $v ?>" <?= ($ex['rest_category'] ?? '') === $v ? 'selected' : '' ?>><?= $label ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <div class="text-muted mt-1" style="font-size:0.7rem;">Determines rest timer duration and warmup routine</div>
+                </div>
                 <div><label class="stat-label d-block mb-1">NOTES</label>
                     <textarea id="ex-notes" class="form-control" rows="2"><?= htmlspecialchars($ex['notes'] ?? '') ?></textarea></div>
             </div>
@@ -311,13 +314,13 @@ async function saveEdit() {
     fd.append('category', document.getElementById('ex-cat').value);
     fd.append('muscle_primary', document.getElementById('ex-muscle').value);
     fd.append('muscle_secondary', document.getElementById('ex-secondary').value);
+    fd.append('rest_category', document.getElementById('ex-rest-cat').value);
     fd.append('notes', document.getElementById('ex-notes').value);
     const r = await fetch('/forge/core/api.php', { method: 'POST', body: fd }).then(r => r.json());
     if (r.status === 'success') location.reload();
     else alert(r.message);
 }
 </script>
-<?php endif; ?>
 
 <?php if ($stats['session_count']): ?>
 <script>
@@ -464,18 +467,6 @@ loadCharts();
     ")->fetchAll(PDO::FETCH_ASSOC);
     $recent_ids = array_column($recently_used, 'id');
 
-    // Rest timer settings (for the timer modal)
-    $rest_timers = [
-        ['key' => 'rest_compound_big4_sec', 'id' => 'rest-big4', 'label' => 'BIG 4 COMPOUND',  'hint' => 'squat · deadlift · bench · ohp',  'max' => 600, 'default' => 300],
-        ['key' => 'rest_compound_sec',      'id' => 'rest-comp', 'label' => 'OTHER COMPOUND',   'hint' => 'rows · lunges · pull-ups etc.',    'max' => 480, 'default' => 240],
-        ['key' => 'rest_bodyweight_sec',    'id' => 'rest-bw',   'label' => 'BODYWEIGHT',       'hint' => 'push-ups · dips · planks etc.',    'max' => 360, 'default' => 180],
-        ['key' => 'rest_isolation_sec',     'id' => 'rest-iso',  'label' => 'ISOLATION',        'hint' => 'curls · flyes · extensions etc.',  'max' => 240, 'default' => 120],
-    ];
-    foreach ($rest_timers as &$rt) {
-        $rt['value'] = (int)get_user_setting($db, $rt['key'], (string)$rt['default']);
-    }
-    unset($rt);
-
     // All exercises
     $all_exercises = $db->query("SELECT * FROM exercises ORDER BY muscle_primary, name")->fetchAll(PDO::FETCH_ASSOC);
 
@@ -495,10 +486,6 @@ loadCharts();
             EXERCISES<span style="color:#FF5722;">_</span>
         </h1>
         <div class="d-flex gap-2">
-            <button class="btn btn-sm px-3" data-bs-toggle="modal" data-bs-target="#restTimerModal"
-                    style="background:#1a1a1a;border:1px solid #333;color:#888;font-weight:700;font-size:0.75rem;letter-spacing:0.5px;">
-                <i class="bi bi-stopwatch me-1"></i>TIMERS
-            </button>
             <button class="btn btn-forge btn-sm px-3" data-bs-toggle="modal" data-bs-target="#addExModal">
                 <i class="bi bi-plus-lg me-1"></i>CUSTOM
             </button>
@@ -532,11 +519,6 @@ loadCharts();
                     </div>
                 </div>
                 <div class="d-flex align-items-center gap-1">
-                    <?php if ($e['is_custom']): ?>
-                    <button class="btn-icon" onclick="event.preventDefault(); openEditInList(<?= htmlspecialchars(json_encode($e)) ?>)" type="button">
-                        <i class="bi bi-pencil" style="font-size:0.85rem; color:#555;"></i>
-                    </button>
-                    <?php endif; ?>
                     <i class="bi bi-chevron-right" style="color:#444; font-size:0.8rem;"></i>
                 </div>
             </div>
@@ -581,9 +563,6 @@ loadCharts();
                     </div>
                     <div class="d-flex align-items-center gap-1">
                         <?php if ($e['is_custom']): ?>
-                        <button class="btn-icon" onclick="event.preventDefault(); openEditInList(<?= htmlspecialchars(json_encode($e)) ?>)" type="button">
-                            <i class="bi bi-pencil" style="font-size:0.85rem; color:#555;"></i>
-                        </button>
                         <button class="btn-icon" onclick="event.preventDefault(); deleteExercise(<?= $e['id'] ?>, this)" type="button">
                             <i class="bi bi-trash" style="font-size:0.85rem; color:#555;"></i>
                         </button>
@@ -608,7 +587,7 @@ loadCharts();
     <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
             <div class="modal-header" style="border-bottom:1px solid #333;">
-                <h5 class="modal-title fw-black uppercase" id="exModalTitle">ADD CUSTOM EXERCISE</h5>
+                <h5 class="modal-title fw-black uppercase">ADD CUSTOM EXERCISE</h5>
                 <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
@@ -728,28 +707,15 @@ async function apiCall(action, data) {
     return fetch('/forge/core/api.php', { method: 'POST', body: fd }).then(r => r.json());
 }
 
-function openEditInList(ex) {
-    document.getElementById('exModalTitle').textContent  = 'EDIT EXERCISE';
-    document.getElementById('modal-ex-id').value         = ex.id;
-    document.getElementById('modal-ex-name').value       = ex.name;
-    document.getElementById('modal-ex-cat').value        = ex.category || 'Other';
-    document.getElementById('modal-ex-muscle').value     = ex.muscle_primary || '';
-    document.getElementById('modal-ex-sec').value        = ex.muscle_secondary || '';
-    document.getElementById('modal-ex-notes').value      = ex.notes || '';
-    new bootstrap.Modal(document.getElementById('addExModal')).show();
-}
-
 document.getElementById('addExModal').addEventListener('hidden.bs.modal', () => {
-    document.getElementById('exModalTitle').textContent = 'ADD CUSTOM EXERCISE';
     ['modal-ex-id','modal-ex-name','modal-ex-sec','modal-ex-notes'].forEach(id => document.getElementById(id).value = '');
 });
 
 async function saveExercise() {
-    const id = document.getElementById('modal-ex-id').value;
     const name = document.getElementById('modal-ex-name').value.trim();
     if (!name) { document.getElementById('modal-ex-name').focus(); return; }
-    const r = await apiCall(id ? 'update_exercise' : 'add_exercise', {
-        id, name,
+    const r = await apiCall('add_exercise', {
+        name,
         category: document.getElementById('modal-ex-cat').value,
         muscle_primary: document.getElementById('modal-ex-muscle').value,
         muscle_secondary: document.getElementById('modal-ex-sec').value,
@@ -767,120 +733,7 @@ async function deleteExercise(id, btn) {
         rows.forEach(r => r.remove());
     } else alert(r.message);
 }
-
-async function saveRestTimer(key, value) {
-    const fd = new FormData();
-    fd.append('action', 'update_setting');
-    fd.append('key', key);
-    fd.append('value', value);
-    await fetch('/forge/core/api.php', { method: 'POST', body: fd });
-}
-function updateRestDisplay(id, seconds) {
-    const m = String(Math.floor(seconds / 60)).padStart(2, '0');
-    const s = String(seconds % 60).padStart(2, '0');
-    document.getElementById(id).textContent = m + ':' + s;
-}
-
-// Notification toggle — delegates to forgeToggleNotifications in active_workout_bar.php
-async function handleNotifToggle(enable) {
-    if (typeof window.forgeToggleNotifications === 'function') {
-        await window.forgeToggleNotifications(enable);
-    } else {
-        if (!('Notification' in window)) {
-            updateNotifStatus();
-            return;
-        }
-        if (enable) {
-            if (Notification.permission === 'default') {
-                const result = await Notification.requestPermission();
-                if (result !== 'granted') {
-                    const toggle = document.getElementById('notif-toggle');
-                    if (toggle) toggle.checked = false;
-                    updateNotifStatus();
-                    return;
-                }
-            }
-            if (Notification.permission === 'granted') {
-                localStorage.setItem('forge_notify_rest', '1');
-            }
-        } else {
-            localStorage.removeItem('forge_notify_rest');
-        }
-    }
-    updateNotifStatus();
-}
-
-function updateNotifStatus() {
-    const toggle = document.getElementById('notif-toggle');
-    const status = document.getElementById('notif-status');
-    if (!toggle || !status) return;
-    const perm = ('Notification' in window) ? Notification.permission : 'unsupported';
-    const enabled = localStorage.getItem('forge_notify_rest') === '1' && perm === 'granted';
-    toggle.checked = enabled;
-    if (perm === 'denied') {
-        status.textContent = 'Blocked — enable in browser settings';
-        status.style.color = '#ef5350';
-        toggle.disabled = true;
-    } else if (!('Notification' in window)) {
-        status.textContent = 'Not supported in this browser';
-        toggle.disabled = true;
-    } else {
-        status.style.color = '#555';
-        status.textContent = enabled ? 'On — fires even when screen is off' : '';
-        toggle.disabled = false;
-    }
-}
-
-// Init toggle state when modal opens
-document.getElementById('restTimerModal')?.addEventListener('show.bs.modal', updateNotifStatus);
 </script>
-
-<!-- Rest Timer Modal -->
-<div class="modal fade" id="restTimerModal" tabindex="-1">
-    <div class="modal-dialog modal-dialog-centered">
-        <div class="modal-content">
-            <div class="modal-header" style="border-bottom:1px solid #333;">
-                <h5 class="modal-title fw-black uppercase">REST TIMERS</h5>
-                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
-            </div>
-            <div class="modal-body">
-                <style>.form-range { accent-color: #FF5722; }</style>
-                <?php foreach ($rest_timers as $rt): ?>
-                <div class="d-flex align-items-center justify-content-between mb-1">
-                    <div>
-                        <span class="stat-label" style="font-size:0.62rem;"><?= $rt['label'] ?></span>
-                        <span class="text-muted" style="font-size:0.6rem;margin-left:4px;"><?= $rt['hint'] ?></span>
-                    </div>
-                    <div class="fw-black" style="font-size:1rem;font-family:monospace;color:#FF5722;" id="<?= $rt['id'] ?>-disp">
-                        <?= gmdate('i:s', $rt['value']) ?>
-                    </div>
-                </div>
-                <input type="range" class="form-range mb-3"
-                       min="30" max="<?= $rt['max'] ?>" step="30" value="<?= $rt['value'] ?>"
-                       oninput="updateRestDisplay('<?= $rt['id'] ?>-disp', this.value)"
-                       onchange="saveRestTimer('<?= $rt['key'] ?>', this.value)">
-                <?php endforeach; ?>
-
-                <hr style="border-color:#333; margin:8px 0 12px;">
-                <div class="d-flex align-items-center justify-content-between">
-                    <div>
-                        <span class="stat-label" style="font-size:0.62rem;">NOTIFICATIONS</span>
-                        <div class="text-muted" style="font-size:0.6rem;">System alert when rest ends</div>
-                    </div>
-                    <div class="form-check form-switch mb-0">
-                        <input class="form-check-input" type="checkbox" role="switch" id="notif-toggle"
-                               style="width:2.5em; height:1.4em; cursor:pointer; accent-color:#FF5722;"
-                               onchange="handleNotifToggle(this.checked)">
-                    </div>
-                </div>
-                <div id="notif-status" style="font-size:0.6rem; color:#555; margin-top:4px;"></div>
-            </div>
-            <div class="modal-footer" style="border-top:1px solid #333;">
-                <button type="button" class="btn btn-forge flex-grow-1" data-bs-dismiss="modal">DONE</button>
-            </div>
-        </div>
-    </div>
-</div>
 
 <?php } ?>
 </body>

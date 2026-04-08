@@ -31,16 +31,22 @@ if ($template_id) {
 
 <div class="container-fluid py-3 px-3" style="max-width:700px; margin:0 auto;">
 
-    <a href="/forge/workout/" class="d-inline-flex align-items-center gap-1 mb-3 text-decoration-none"
-       style="color:#888; font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:1px;">
-        <i class="bi bi-chevron-left"></i> WORKOUTS
-    </a>
+    <div class="d-flex align-items-center justify-content-between mb-3">
+        <a href="/forge/workout/" class="d-inline-flex align-items-center gap-1 text-decoration-none"
+           style="color:#888; font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:1px;">
+            <i class="bi bi-chevron-left"></i> WORKOUTS
+        </a>
+        <button class="btn btn-sm" onclick="deleteCurrentTemplate()" type="button"
+                style="background:transparent; border:1px solid #5a1a1a; color:#ef5350; font-weight:700; font-size:0.7rem; letter-spacing:0.5px; min-height:32px; padding:0 10px;">
+            <i class="bi bi-trash me-1"></i>DELETE
+        </button>
+    </div>
 
     <!-- Template name (editable) -->
     <div class="d-flex align-items-center gap-2 mb-1">
         <input type="text" id="tpl-name" class="form-control fw-black"
                value="<?= htmlspecialchars($template['name']) ?>"
-               style="font-size:1.3rem; letter-spacing:-1px; background:transparent !important; border:none !important; border-bottom:1px solid #333 !important; border-radius:0 !important; padding:4px 0 !important; box-shadow:none !important;">
+               style="font-size:1.3rem; letter-spacing:-1px; background:transparent !important; border:none !important; border-bottom:1px solid #333 !important; border-radius:0 !important; padding:4px 0 !important; box-shadow:none !important; flex:1;">
     </div>
     <div class="mb-3">
         <input type="text" id="tpl-notes" class="form-control"
@@ -175,10 +181,6 @@ if ($template_id) {
     <button id="save-tpl-btn" class="btn btn-forge w-100" onclick="saveTemplate()" type="button"
             style="font-weight:900; font-size:0.85rem; letter-spacing:1px; min-height:48px;">
         SAVE TEMPLATE
-    </button>
-    <button class="btn w-100 mt-2" onclick="deleteCurrentTemplate()" type="button"
-            style="background:transparent; border:1px solid #5a1f1f; color:#ef5350; font-weight:800; letter-spacing:0.6px; min-height:44px;">
-        <i class="bi bi-trash me-1"></i>DELETE TEMPLATE
     </button>
 
 </div>
@@ -484,17 +486,65 @@ document.getElementById('addTeModal').addEventListener('show.bs.modal', () => {
 } else {
 // ---- TEMPLATE LIST ----
     $templates = $db->query("
-        SELECT t.*, COUNT(te.id) as exercise_count,
-               SUM(CASE WHEN te.ab_group IS NOT NULL THEN 1 ELSE 0 END) as ab_count
+        SELECT t.*,
+               COUNT(te.id)                                       as exercise_count,
+               SUM(CASE WHEN te.ab_group IS NOT NULL THEN 1 ELSE 0 END) as ab_count,
+               MAX(w.finished_at)                                 as last_used
         FROM templates t
         LEFT JOIN template_exercises te ON te.template_id = t.id
+        LEFT JOIN workouts w ON w.template_id = t.id AND w.finished_at IS NOT NULL
         GROUP BY t.id
         ORDER BY t.name
     ")->fetchAll(PDO::FETCH_ASSOC);
 
+    // Fetch exercises from the most recent workout that used each template
+    $last_workout_ids = [];
+    foreach ($templates as $t) {
+        if ($t['last_used']) {
+            $lw = $db->prepare("
+                SELECT w.id FROM workouts w
+                WHERE w.template_id = ? AND w.finished_at IS NOT NULL
+                ORDER BY w.finished_at DESC LIMIT 1
+            ");
+            $lw->execute([$t['id']]);
+            $wid = $lw->fetchColumn();
+            if ($wid) $last_workout_ids[$t['id']] = (int)$wid;
+        }
+    }
+    $template_last_exercises = [];
+    if ($last_workout_ids) {
+        $placeholders = implode(',', array_fill(0, count($last_workout_ids), '?'));
+        $lw_stmt = $db->prepare("
+            SELECT ws.workout_id, e.name,
+                   COUNT(CASE WHEN ws.set_type = 'working' THEN 1 END) as working_sets
+            FROM workout_sets ws
+            JOIN exercises e ON e.id = ws.exercise_id
+            WHERE ws.workout_id IN ($placeholders)
+            GROUP BY ws.workout_id, ws.exercise_id, e.name
+            ORDER BY ws.workout_id, MIN(ws.id)
+        ");
+        $lw_stmt->execute(array_values($last_workout_ids));
+        foreach ($lw_stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $tid = array_search((int)$row['workout_id'], $last_workout_ids);
+            if ($tid !== false) {
+                if (!isset($template_last_exercises[$tid])) $template_last_exercises[$tid] = [];
+                $template_last_exercises[$tid][] = $row;
+            }
+        }
+    }
+
     $page_title   = 'Templates';
     $page_context = 'templates';
     include __DIR__ . '/../core/page_head.php';
+
+function fmtAgo(string $dt): string {
+    $diff = time() - strtotime($dt);
+    if ($diff < 86400)    return 'today';
+    if ($diff < 172800)   return 'yesterday';
+    if ($diff < 604800)   return (int)($diff / 86400) . 'd ago';
+    if ($diff < 2592000)  return (int)($diff / 604800) . 'w ago';
+    return date('j M', strtotime($dt));
+}
 ?>
 
 <div class="container-fluid py-3 px-3" style="max-width:700px; margin:0 auto;">
@@ -515,44 +565,58 @@ document.getElementById('addTeModal').addEventListener('show.bs.modal', () => {
     </div>
     <?php else: ?>
     <div class="d-grid gap-2">
-    <?php foreach ($templates as $t): ?>
-    <div class="card">
+    <?php foreach ($templates as $t):
+        $tExercises = $template_last_exercises[$t['id']] ?? [];
+    ?>
+    <div class="card" style="position:relative; background:#1e1e1e; border:1px solid #333;">
+        <!-- Edit — top right absolute -->
+        <a href="/forge/templates/?id=<?= $t['id'] ?>"
+           class="btn btn-sm"
+           style="position:absolute; top:10px; right:10px; background:transparent; border:1px solid #333; color:#888; font-weight:700; font-size:0.7rem; letter-spacing:0.5px; min-height:28px; padding:0 8px; display:flex; align-items:center; z-index:1;">
+            <i class="bi bi-pencil me-1" style="font-size:0.75rem;"></i>EDIT
+        </a>
         <div class="card-body py-3 px-3">
-            <div class="d-flex align-items-start justify-content-between">
-                <div class="min-w-0 me-2">
-                    <div class="fw-black" style="font-size:1rem; letter-spacing:-0.5px;">
-                        <?= htmlspecialchars($t['name']) ?>
-                    </div>
-                    <?php if ($t['notes']): ?>
-                    <div class="text-muted" style="font-size:0.75rem;"><?= htmlspecialchars($t['notes']) ?></div>
-                    <?php endif; ?>
-                    <div class="mt-1 d-flex align-items-center gap-2" style="font-size:0.75rem; color:#888;">
-                        <span><i class="bi bi-list-ul me-1"></i><?= $t['exercise_count'] ?> exercise<?= $t['exercise_count'] != 1 ? 's' : '' ?></span>
-                        <?php if ($t['ab_count'] > 0):
-                            $next_ab = ($t['last_ab_variant'] === 'A') ? 'B' : 'A';
-                        ?>
-                        <span style="font-size:0.65rem; font-weight:900; padding:1px 5px; border-radius:3px; <?= $next_ab === 'A' ? 'background:#1a3a5c;color:#64b5f6;' : 'background:#3a1a5c;color:#ce93d8;' ?>">
-                            NEXT: <?= $next_ab ?>
-                        </span>
-                        <?php endif; ?>
-                    </div>
+            <div class="mb-2">
+                <div style="font-weight:700; font-size:0.95rem; color:#e0e0e0; padding-right:70px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                    <?= htmlspecialchars($t['name']) ?>
                 </div>
-                <div class="d-flex gap-1 flex-shrink-0">
-                    <a href="/forge/templates/?id=<?= $t['id'] ?>" class="btn btn-sm btn-forge-outline px-3" style="min-height:36px; line-height:1; display:flex; align-items:center;">
-                        EDIT
-                    </a>
-                    <form method="POST" action="/forge/workout/" style="display:inline;">
-                        <input type="hidden" name="action" value="start_workout">
-                        <input type="hidden" name="template_id" value="<?= $t['id'] ?>">
-                        <button type="submit" class="btn btn-sm btn-forge px-3" style="min-height:36px;">
-                            <i class="bi bi-lightning-charge-fill"></i>
-                        </button>
-                    </form>
-                    <button class="btn-icon" onclick="deleteTemplate(<?= $t['id'] ?>, this)" type="button">
-                        <i class="bi bi-trash" style="font-size:0.85rem;"></i>
-                    </button>
+                <?php if ($t['notes']): ?>
+                <div class="text-muted" style="font-size:0.75rem; padding-right:70px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                    <?= htmlspecialchars($t['notes']) ?>
                 </div>
+                <?php endif; ?>
+                <?php if ($t['last_used']): ?>
+                <div class="text-muted" style="font-size:0.65rem; margin-top:2px;">
+                    Last performed <?= fmtAgo($t['last_used']) ?>
+                </div>
+                <?php endif; ?>
             </div>
+            <?php if (!empty($tExercises)): ?>
+            <div class="d-flex flex-wrap gap-1">
+                <?php foreach ($tExercises as $ex): ?>
+                <span style="background:#141414; border:1px solid #2a2a2a; border-radius:4px; padding:2px 7px; font-size:0.65rem; color:#888; white-space:nowrap;">
+                    <?= htmlspecialchars($ex['name']) ?><?php if ($ex['working_sets']): ?><span style="color:#444;"> ×<?= $ex['working_sets'] ?></span><?php endif; ?>
+                </span>
+                <?php endforeach; ?>
+            </div>
+            <?php elseif ($t['exercise_count'] > 0): ?>
+            <div class="text-muted" style="font-size:0.65rem;">
+                <i class="bi bi-list-ul me-1"></i><?= $t['exercise_count'] ?> exercise<?= $t['exercise_count'] != 1 ? 's' : '' ?>
+                <?php if ($t['ab_count'] > 0): ?>
+                    · <span style="font-size:0.6rem; font-weight:900; padding:1px 4px; border-radius:3px; <?= (($t['last_ab_variant'] ?? '') === 'A' ? 'background:#1a3a5c;color:#64b5f6;' : 'background:#3a1a5c;color:#ce93d8;') ?>">
+                    NEXT: <?= (($t['last_ab_variant'] ?? '') === 'A') ? 'B' : 'A' ?>
+                    </span>
+                <?php endif; ?>
+            </div>
+            <?php endif; ?>
+            <!-- Start Workout — bottom right, full width -->
+            <form method="POST" action="/forge/workout/" class="mt-3">
+                <input type="hidden" name="action" value="start_workout">
+                <input type="hidden" name="template_id" value="<?= $t['id'] ?>">
+                <button type="submit" class="btn btn-forge w-100 py-2" style="font-weight:900; font-size:0.9rem; letter-spacing:0.5px;">
+                    <i class="bi bi-lightning-charge-fill me-2"></i>START WORKOUT
+                </button>
+            </form>
         </div>
     </div>
     <?php endforeach; ?>

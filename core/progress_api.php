@@ -36,7 +36,7 @@ try {
                    MAX(CASE
                        WHEN ws.reps = 1 AND ws.weight_kg > 0
                        THEN ws.weight_kg
-                       WHEN ws.reps > 1 AND ws.reps <= 12 AND ws.weight_kg > 0
+                       WHEN ws.reps > 1 AND ws.reps <= 30 AND ws.weight_kg > 0
                        THEN ws.weight_kg * (1 + ws.reps / 30.0)
                        ELSE NULL
                    END) as estimated_1rm
@@ -361,7 +361,7 @@ try {
                 FROM workout_sets ws
                 JOIN workouts w ON w.id = ws.workout_id
                 WHERE ws.exercise_id = ?
-                  AND ws.reps > 1 AND ws.reps <= 12 AND ws.weight_kg > 0
+                  AND ws.reps > 1 AND ws.reps <= 30 AND ws.weight_kg > 0
                   AND ws.set_type = 'working' AND w.finished_at IS NOT NULL
                 GROUP BY DATE(w.started_at)
                 ORDER BY date ASC

@@ -155,12 +155,7 @@ body { background-color: #121212; color: #e0e0e0; font-family: 'Inter', sans-ser
 }
 .set-table .input-set:focus { border-color: #FF5722; outline: none; }
 
-/* PR flash */
-.pr-flash {
-    background: rgba(255,87,34,0.15);
-    border: 1px solid #FF5722;
-    border-radius: 4px;
-}
+/* PR badge column */
 .pr-badge {
     background: #FF5722;
     color: #fff;
@@ -170,6 +165,21 @@ body { background-color: #121212; color: #e0e0e0; font-family: 'Inter', sans-ser
     border-radius: 3px;
     letter-spacing: 0.5px;
     vertical-align: middle;
+    white-space: nowrap;
+    display: inline-block;
+}
+.pr-cell { text-align: center; vertical-align: middle; }
+
+/* PR trophy burst animation (fires on tick, fades to green check) */
+@keyframes prTrophyPop {
+    0%   { transform: scale(0.4); opacity: 0; }
+    20%  { transform: scale(1.5); opacity: 1; }
+    60%  { transform: scale(1.1); opacity: 1; }
+    100% { transform: scale(1.0); opacity: 0; }
+}
+.pr-trophy-anim {
+    display: inline-block;
+    animation: prTrophyPop 2s ease-out forwards;
 }
 
 /* Warm-up set styling */

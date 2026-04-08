@@ -31,7 +31,7 @@ $nav_items = [
             </a>
             <?php endforeach; ?>
             <a class="nav-link forge-nav-link d-flex flex-column align-items-center justify-content-center px-1"
-               href="/spence/" style="min-width: 36px; padding-top: 6px; padding-bottom: 6px; opacity: 0.4;">
+               href="/spence/" target="_blank" rel="noopener" style="min-width: 36px; padding-top: 6px; padding-bottom: 6px; opacity: 0.4;">
                 <i class="bi bi-box-arrow-up-right" style="font-size: 1.2rem; line-height: 1; display: block;"></i>
                 <span style="font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0; font-weight: 700; line-height: 1.3; margin-top: 3px;">SPNC</span>
             </a>
@@ -46,7 +46,7 @@ $nav_items = [
                 <i class="bi <?= $item['icon'] ?> me-1"></i><?= $item['label'] ?>
             </a>
             <?php endforeach; ?>
-            <a class="nav-link forge-nav-link" href="/spence/" style="opacity: 0.4; font-size: 0.75rem;">
+            <a class="nav-link forge-nav-link" href="/spence/" target="_blank" rel="noopener" style="opacity: 0.4; font-size: 0.75rem;">
                 <i class="bi bi-box-arrow-up-right me-1"></i>SPENCE
             </a>
         </div>

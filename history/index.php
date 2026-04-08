@@ -42,7 +42,7 @@ if ($exercise_id) {
     $set_stmt = $db->prepare("
         SELECT set_number, set_type, weight_kg, reps, rpe,
                CASE WHEN weight_kg > 0 AND reps = 1 THEN weight_kg
-                    WHEN weight_kg > 0 AND reps > 1 AND reps <= 12
+                    WHEN weight_kg > 0 AND reps > 1 AND reps <= 30
                     THEN ROUND(weight_kg * (1 + reps / 30.0), 1)
                     ELSE NULL END as estimated_1rm
         FROM workout_sets
@@ -132,7 +132,7 @@ if ($exercise_id) {
     if (!$workout) { header("Location: /forge/history/"); exit; }
 
     $stmt = $db->prepare("
-        SELECT ws.*, e.name as exercise_name, e.muscle_primary
+        SELECT ws.*, e.name as exercise_name, e.muscle_primary, e.category
         FROM workout_sets ws
         JOIN exercises e ON e.id = ws.exercise_id
         WHERE ws.workout_id = ?
@@ -143,7 +143,12 @@ if ($exercise_id) {
     foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $s) {
         $eid = (int)$s['exercise_id'];
         if (!isset($exercises[$eid])) {
-            $exercises[$eid] = ['name' => $s['exercise_name'], 'muscle' => $s['muscle_primary'], 'sets' => []];
+            $exercises[$eid] = [
+                'name' => $s['exercise_name'],
+                'muscle' => $s['muscle_primary'],
+                'category' => $s['category'],
+                'sets' => []
+            ];
         }
         $exercises[$eid]['sets'][] = $s;
     }
@@ -200,7 +205,9 @@ if ($exercise_id) {
     </div>
     <?php endif; ?>
 
-    <?php foreach ($exercises as $eid => $ex): ?>
+    <?php foreach ($exercises as $eid => $ex):
+        $is_cardio = ($ex['category'] === 'Cardio');
+    ?>
     <div class="card mb-3">
         <div class="card-body pb-2">
             <div class="d-flex align-items-center gap-2 mb-2">
@@ -211,6 +218,26 @@ if ($exercise_id) {
             </div>
             <div class="table-responsive">
             <table class="set-table" style="table-layout:fixed; width:100%;">
+                <?php if ($is_cardio): ?>
+                <colgroup><col style="width:28px;"><col style="width:70px;"><col><col><col><col style="width:44px;"><col style="width:44px;"></colgroup>
+                <thead><tr><th>#</th><th>TYPE</th><th>TIME</th><th>KM</th><th>AVG SPEED</th><th>AVG HR</th><th>MAX HR</th></tr></thead>
+                <tbody>
+                <?php foreach ($ex['sets'] as $i => $s):
+                    $set_speed = ($s['distance_km'] && $s['duration_sec'])
+                        ? round($s['distance_km'] / ($s['duration_sec'] / 3600.0), 2) . ' km/h'
+                        : '—';
+                ?>
+                <tr>
+                    <td style="font-weight:900; color:#888; font-size:0.9rem;"><?= $i + 1 ?></td>
+                    <td><span class="set-type-badge badge-<?= $s['set_type'] ?>"><?= $s['set_type'] ?></span></td>
+                    <td style="font-weight:700;"><?= $s['duration_sec'] ? gmdate('i:s', (int)$s['duration_sec']) : '—' ?></td>
+                    <td style="font-weight:700;"><?= $s['distance_km'] ?? '—' ?></td>
+                    <td style="font-weight:700;"><?= $set_speed ?></td>
+                    <td style="color:#888;"><?= $s['hr_avg'] ?? '—' ?></td>
+                    <td style="color:#888;"><?= $s['hr_max'] ?? '—' ?></td>
+                </tr>
+                <?php endforeach; ?>
+                <?php else: ?>
                 <colgroup><col style="width:28px;"><col style="width:70px;"><col><col><col style="width:52px;"></colgroup>
                 <thead><tr><th>#</th><th>TYPE</th><th><?= strtoupper($unit) ?></th><th>REPS</th><th>RPE</th></tr></thead>
                 <tbody>
@@ -223,6 +250,7 @@ if ($exercise_id) {
                     <td style="color:#888;"><?= $s['rpe'] ?? '—' ?></td>
                 </tr>
                 <?php endforeach; ?>
+                <?php endif; ?>
                 </tbody>
             </table>
             </div>

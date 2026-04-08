@@ -113,7 +113,7 @@ if (!empty($_ab_rows)) {
     <div id="ab-rest-display" style="font-size:1.6rem; font-weight:900; font-family:monospace; color:#FF5722; letter-spacing:-1px; line-height:1;">0:00</div>
   </div>
 
-  <!-- Right: timer controls + continue -->
+  <!-- Right: timer controls + action button -->
   <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
     <div id="ab-timer-btns" style="display:none; align-items:center; gap:6px;">
       <button onclick="addRestTime(-30)" style="background:#1e1e1e; border:1px solid #333; color:#888; min-height:40px; padding:0 10px; font-weight:700; font-size:0.75rem; border-radius:4px; cursor:pointer;">−30s</button>
@@ -121,9 +121,16 @@ if (!empty($_ab_rows)) {
       <button onclick="skipRest()"       style="background:#1e1e1e; border:1px solid #555; color:#888; min-height:40px; padding:0 10px; font-weight:700; font-size:0.75rem; border-radius:4px; cursor:pointer;">SKIP</button>
     </div>
     <?php if (!$_ab_on_workout_page): ?>
-    <a href="/forge/workout/" style="background:#FF5722; color:#fff; border:none; border-radius:6px; font-weight:900; font-size:0.75rem; padding:10px 14px; text-decoration:none; white-space:nowrap; min-height:40px; display:flex; align-items:center; gap:4px; letter-spacing:0.3px;">
-      <?= $_ab_all_done ? 'FINISH <i class="bi bi-check-circle-fill"></i>' : 'CONTINUE <i class="bi bi-arrow-right-circle-fill"></i>' ?>
+    <a id="ab-continue-btn" href="/forge/workout/" style="display:<?= $_ab_all_done ? 'none' : 'flex' ?>; background:#FF5722; color:#fff; border:none; border-radius:6px; font-weight:900; font-size:0.75rem; padding:10px 14px; text-decoration:none; white-space:nowrap; min-height:40px; align-items:center; gap:4px; letter-spacing:0.3px;">
+      CONTINUE <i class="bi bi-arrow-right-circle-fill"></i>
     </a>
+    <a id="ab-done-btn" href="/forge/workout/" style="display:<?= $_ab_all_done ? 'flex' : 'none' ?>; background:#4caf50; color:#fff; border:none; border-radius:6px; font-weight:900; font-size:0.75rem; padding:10px 14px; text-decoration:none; white-space:nowrap; min-height:40px; align-items:center; gap:4px; letter-spacing:0.3px;">
+      FINISH <i class="bi bi-check-circle-fill"></i>
+    </a>
+    <?php else: ?>
+    <button id="ab-done-btn" onclick="openFinishModal()" style="display:<?= $_ab_all_done ? 'flex' : 'none' ?>; background:#4caf50; color:#fff; border:none; border-radius:6px; font-weight:900; font-size:0.75rem; padding:10px 14px; white-space:nowrap; min-height:40px; cursor:pointer; font-family:inherit; align-items:center; gap:4px; letter-spacing:0.3px;">
+      FINISH <i class="bi bi-check-circle-fill"></i>
+    </button>
     <?php endif; ?>
   </div>
 </div>
@@ -155,6 +162,7 @@ if (!empty($_ab_rows)) {
     // ── Service Worker + rest-alert preferences ──────────────────────────────
     const NOTIF_KEY = 'forge_notify_rest';
     const SOUND_KEY = 'forge_sound_rest';
+    const NOTIF_TAG  = 'forge-rest-timer';
     let swReg = null;
 
     // Default bell to ON for existing users.
@@ -201,16 +209,28 @@ if (!empty($_ab_rows)) {
                     body: 'Time to lift.',
                     icon: '/forge/core/favicon.svg',
                     badge: '/forge/core/favicon.svg',
-                    tag: 'forge-rest-timer',
+                    tag: NOTIF_TAG,
                     renotify: true,
                     data: { url: '/forge/workout/' },
                     actions: [{ action: 'open', title: 'Back to workout' }],
                 });
+                localStorage.setItem('forge_last_notif_tag', NOTIF_TAG);
             } else if (notificationGranted()) {
                 new Notification('FORGE — Rest done', { body: 'Time to lift.' });
             }
         } catch (e) {}
     }
+
+    // Dismiss system notification when user returns to FORGE
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+            const tag = localStorage.getItem('forge_last_notif_tag');
+            if (tag) {
+                localStorage.removeItem('forge_last_notif_tag');
+                swPost({ type: 'CLOSE_NOTIFICATION', tag });
+            }
+        }
+    });
 
     // ── Audio bell ──────────────────────────────────────────────────────────
     function playBell() {

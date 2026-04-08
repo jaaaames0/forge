@@ -6,6 +6,35 @@ $db          = get_db_connection();
 $unit        = 'kg';
 $rest_default = 90;
 
+// Warmup presets for conditional warmup icon rendering
+$warmup_keys = [
+    'compound_big4' => 'compound',
+    'compound'      => 'compound',
+    'bodyweight'    => 'bodyweight',
+    'isolation'     => 'accessory',
+];
+$warmup_preset_exists = [];
+foreach (['compound', 'bodyweight', 'accessory'] as $cat) {
+    $warmup_preset_exists[$cat] = (bool)get_user_setting($db, 'warmup_presets_' . $cat, '');
+}
+function warmup_icon_visible(string $rest_category, array $exists): bool {
+    // Bodyweight exercises are not eligible for warmup calculations
+    if ($rest_category === 'bodyweight') return false;
+    global $warmup_keys;
+    $key = $warmup_keys[$rest_category] ?? null;
+    return $key && ($exists[$key] ?? false);
+}
+
+// Warmup presets for JS global (addExercise path)
+$wp_compound   = get_user_setting($db, 'warmup_presets_compound',   '');
+$wp_bodyweight = get_user_setting($db, 'warmup_presets_bodyweight', '');
+$wp_accessory  = get_user_setting($db, 'warmup_presets_accessory',  '');
+$warmup_presets_json = json_encode([
+    'compound'   => $wp_compound   ? json_decode($wp_compound)   : null,
+    'bodyweight' => $wp_bodyweight ? json_decode($wp_bodyweight) : null,
+    'accessory'  => $wp_accessory  ? json_decode($wp_accessory)  : null,
+]);
+
 // Handle form POST (start workout from start screen)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'start_workout') {
     $existing = $db->query("SELECT id FROM workouts WHERE finished_at IS NULL LIMIT 1")->fetchColumn();
@@ -33,7 +62,8 @@ if ($active) {
     // Primary source: workout_exercises (persists even when no sets logged)
     $stmt = $db->prepare("
         SELECT e.id as exercise_id, e.name as exercise_name, e.category,
-               e.muscle_primary, e.bw_factor, e.rest_category, we.order_num, we.target_sets
+               e.muscle_primary, e.bw_factor, e.rest_category, we.order_num, we.target_sets,
+               we.progression_applied_weight
         FROM workout_exercises we
         JOIN exercises e ON e.id = we.exercise_id
         WHERE we.workout_id = ?
@@ -52,6 +82,7 @@ if ($active) {
             'sets'           => [],
             'prev'           => [],
             'target_sets'    => (int)($row['target_sets'] ?? 3),
+            'progression_applied_weight' => $row['progression_applied_weight'] !== null ? (float)$row['progression_applied_weight'] : null,
         ];
     }
 
@@ -155,26 +186,34 @@ if ($active) {
         }
     }
 
-    // Fetch previous-session sets for each exercise (for the PREV column)
+    // Fetch previous-session sets for each exercise (for the PREV column).
+    // Constrained to the single most recent finished workout that included this exercise,
+    // so set N always maps to set N from that session — no cross-session bleed.
     foreach (array_keys($exercises) as $eid) {
         $stmt = $db->prepare("
             SELECT ws.set_number, ws.weight_kg, ws.added_weight_kg, ws.reps, ws.rpe,
                    ws.duration_sec, ws.distance_km
             FROM workout_sets ws
-            JOIN workouts w ON w.id = ws.workout_id
             WHERE ws.exercise_id = ?
               AND ws.set_type = 'working'
-              AND w.finished_at IS NOT NULL
-              AND w.id != ?
-            ORDER BY w.finished_at DESC, ws.set_number ASC
-            LIMIT 20
+              AND ws.workout_id = (
+                  SELECT w2.id FROM workouts w2
+                  JOIN workout_sets ws2 ON ws2.workout_id = w2.id
+                  WHERE ws2.exercise_id = ? AND w2.finished_at IS NOT NULL AND w2.id != ?
+                  ORDER BY w2.finished_at DESC LIMIT 1
+              )
+            ORDER BY ws.set_number ASC
         ");
-        $stmt->execute([$eid, $active['id']]);
+        $stmt->execute([$eid, $eid, $active['id']]);
         $exercises[$eid]['prev'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-        // Progression suggestion (only for exercises with no sets logged yet this session)
+        // Progression suggestion: compute whenever a scheme exists, so the hint
+        // survives partial-logging reloads. Display rules (handled at render time):
+        //   - Always show if any working set is still un-ticked (cases 1, 3, 4)
+        //   - Show in greyed/applied state if user clicked it (cases 2, 4, 6)
+        //   - Hide only when all sets logged AND user never clicked it (case 5)
         $exercises[$eid]['suggestion'] = null;
-        if (empty($exercises[$eid]['sets']) && !empty($exercises[$eid]['progression_scheme'])) {
+        if (!empty($exercises[$eid]['progression_scheme'])) {
             $exercises[$eid]['suggestion'] = compute_progression_suggestion($db, $exercises[$eid]);
         }
     }
@@ -195,12 +234,58 @@ if ($active) {
         GROUP BY t.id
         ORDER BY use_count DESC, last_used ASC
     ")->fetchAll(PDO::FETCH_ASSOC);
+
+    // Fetch exercise names from the most recent workout that used each template,
+    // for display in the template cards.
+    $last_workout_ids = [];
+    foreach ($templates as $t) {
+        if ($t['last_used']) {
+            $lw = $db->prepare("
+                SELECT w.id FROM workouts w
+                WHERE w.template_id = ? AND w.finished_at IS NOT NULL
+                ORDER BY w.finished_at DESC LIMIT 1
+            ");
+            $lw->execute([$t['id']]);
+            $wid = $lw->fetchColumn();
+            if ($wid) $last_workout_ids[$t['id']] = (int)$wid;
+        }
+    }
+    $template_last_exercises = [];
+    if ($last_workout_ids) {
+        $placeholders = implode(',', array_fill(0, count($last_workout_ids), '?'));
+        $lw_stmt = $db->prepare("
+            SELECT ws.workout_id, e.name,
+                   COUNT(CASE WHEN ws.set_type = 'working' THEN 1 END) as working_sets
+            FROM workout_sets ws
+            JOIN exercises e ON e.id = ws.exercise_id
+            WHERE ws.workout_id IN ($placeholders)
+            GROUP BY ws.workout_id, ws.exercise_id, e.name
+            ORDER BY ws.workout_id, MIN(ws.id)
+        ");
+        $lw_stmt->execute(array_values($last_workout_ids));
+        foreach ($lw_stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $tid = array_search((int)$row['workout_id'], $last_workout_ids);
+            if ($tid !== false) {
+                if (!isset($template_last_exercises[$tid])) $template_last_exercises[$tid] = [];
+                $template_last_exercises[$tid][] = $row;
+            }
+        }
+    }
+}
+
+function fmtAgo(string $dt): string {
+    $diff = time() - strtotime($dt);
+    if ($diff < 86400)    return 'today';
+    if ($diff < 172800)   return 'yesterday';
+    if ($diff < 604800)   return (int)($diff / 86400) . 'd ago';
+    if ($diff < 2592000)  return (int)($diff / 604800) . 'w ago';
+    return date('j M', strtotime($dt));
 }
 
 // Helper: get previous set data for a given 1-based set number
 function prevForSet(array $prevSets, int $setNum): ?array {
     if (empty($prevSets)) return null;
-    return $prevSets[$setNum - 1] ?? $prevSets[count($prevSets) - 1];
+    return $prevSets[$setNum - 1] ?? null;
 }
 
 function muscleBadge(?string $muscle): string {
@@ -212,8 +297,13 @@ function muscleBadge(?string $muscle): string {
 $workout_name = $active['name'] ?? '';
 $page_title   = $active ? 'Workout' : 'Start Workout';
 $page_context = 'workout';
-include __DIR__ . '/../core/page_head.php';
 ?>
+<script>window.forgeWarmupPresets = <?= $warmup_presets_json ?>;
+// Normalise PHP null (string "null") to actual JS null
+['compound','bodyweight','accessory'].forEach(k=>{
+    if(window.forgeWarmupPresets[k]==='null'||window.forgeWarmupPresets[k]==='') window.forgeWarmupPresets[k]=null;
+});</script>
+<?php include __DIR__ . '/../core/page_head.php'; ?>
 
 <?php if (!$active): ?>
 <!-- =========================================================
@@ -236,41 +326,58 @@ include __DIR__ . '/../core/page_head.php';
 
     <div class="d-flex align-items-center justify-content-between mb-2">
         <div class="stat-label">FROM TEMPLATE</div>
-        <div class="d-flex gap-2">
-            <button id="edit-mode-btn" class="btn btn-sm" onclick="toggleEditMode()"
-                    style="background:transparent; border:1px solid #333; color:#666; font-weight:700; font-size:0.75rem; letter-spacing:0.5px; min-height:32px; padding:0 10px;">
-                <i class="bi bi-pencil me-1"></i>EDIT
-            </button>
-            <button class="btn btn-sm" onclick="openNewTemplateModal()"
-                    style="background:transparent; border:1px solid #333; color:#FF5722; font-weight:700; font-size:0.75rem; letter-spacing:0.5px; min-height:32px; padding:0 10px;">
-                <i class="bi bi-plus me-1"></i>NEW
-            </button>
-        </div>
+        <button class="btn btn-sm" onclick="openNewTemplateModal()"
+                style="background:transparent; border:1px solid #333; color:#FF5722; font-weight:700; font-size:0.75rem; letter-spacing:0.5px; min-height:32px; padding:0 10px;">
+            <i class="bi bi-plus me-1"></i>NEW
+        </button>
     </div>
     <?php if (!empty($templates)): ?>
     <div class="d-grid gap-2" id="template-list">
-        <?php foreach ($templates as $t): ?>
-        <form method="POST" class="template-form" data-template-id="<?= $t['id'] ?>">
-            <input type="hidden" name="action" value="start_workout">
-            <input type="hidden" name="template_id" value="<?= $t['id'] ?>">
-            <button type="submit" class="btn w-100 text-start d-flex align-items-center justify-content-between template-btn"
-                    style="background:#1e1e1e; border:1px solid #333; color:#e0e0e0; padding:12px 14px; min-height:56px;">
-                <div class="min-w-0 me-2">
-                    <div style="font-weight:700; font-size:0.95rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"><?= htmlspecialchars($t['name']) ?></div>
+        <?php foreach ($templates as $t):
+            $tExercises = $template_last_exercises[$t['id']] ?? [];
+        ?>
+        <div class="card template-card" style="position:relative; background:#1e1e1e; border:1px solid #333;">
+            <!-- Edit — top right absolute -->
+            <a href="/forge/templates/?id=<?= (int)$t['id'] ?>"
+               class="btn btn-sm"
+               style="position:absolute; top:10px; right:10px; background:transparent; border:1px solid #333; color:#888; font-weight:700; font-size:0.7rem; letter-spacing:0.5px; min-height:28px; padding:0 8px; display:flex; align-items:center; z-index:1;">
+                <i class="bi bi-pencil me-1" style="font-size:0.75rem;"></i>EDIT
+            </a>
+            <div class="card-body py-3 px-3">
+                <div class="mb-2">
+                    <div style="font-weight:700; font-size:0.95rem; color:#e0e0e0; padding-right:70px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                        <?= htmlspecialchars($t['name']) ?>
+                    </div>
                     <?php if ($t['notes']): ?>
-                    <div class="text-muted" style="font-size:0.75rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"><?= htmlspecialchars($t['notes']) ?></div>
+                    <div class="text-muted" style="font-size:0.75rem; padding-right:70px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                        <?= htmlspecialchars($t['notes']) ?>
+                    </div>
+                    <?php endif; ?>
+                    <?php if ($t['last_used']): ?>
+                    <div class="text-muted" style="font-size:0.65rem; margin-top:2px;">
+                        Last performed <?= fmtAgo($t['last_used']) ?>
+                    </div>
                     <?php endif; ?>
                 </div>
-                <div class="d-flex align-items-center gap-2 flex-shrink-0">
-                    <i class="bi bi-pencil edit-mode-icon d-none" style="font-size:0.85rem;color:#FF5722;"></i>
-                    <i class="bi bi-trash edit-mode-delete d-none"
-                       data-delete-template-id="<?= (int)$t['id'] ?>"
-                       title="Delete template"
-                       style="font-size:0.85rem;color:#ef5350;cursor:pointer;"></i>
-                    <span class="text-accent fw-black" style="font-size:1rem;"><?= $t['exercise_count'] ?></span><span class="text-muted" style="font-size:0.75rem;font-weight:400;"> ex</span>
+                <?php if (!empty($tExercises)): ?>
+                <div class="d-flex flex-wrap gap-1">
+                    <?php foreach ($tExercises as $ex): ?>
+                    <span style="background:#141414; border:1px solid #2a2a2a; border-radius:4px; padding:2px 7px; font-size:0.65rem; color:#888; white-space:nowrap;">
+                        <?= htmlspecialchars($ex['name']) ?><?php if ($ex['working_sets']): ?><span style="color:#444;"> ×<?= $ex['working_sets'] ?></span><?php endif; ?>
+                    </span>
+                    <?php endforeach; ?>
                 </div>
-            </button>
-        </form>
+                <?php endif; ?>
+                <!-- Start Workout — bottom right, full width -->
+                <form method="POST" class="mt-3">
+                    <input type="hidden" name="action" value="start_workout">
+                    <input type="hidden" name="template_id" value="<?= $t['id'] ?>">
+                    <button type="submit" class="btn btn-forge w-100 py-2" style="font-weight:900; font-size:0.9rem; letter-spacing:0.5px;">
+                        <i class="bi bi-lightning-charge-fill me-2"></i>START WORKOUT
+                    </button>
+                </form>
+            </div>
+        </div>
         <?php endforeach; ?>
     </div>
     <?php else: ?>
@@ -350,14 +457,25 @@ include __DIR__ . '/../core/page_head.php';
             ? (empty($existingSets) ? 1 : 0)
             : max(0, ($ex['target_sets'] ?? 3) - count($existingSets));
 
+        // Progression display state. Suggestion is hidden only when all sets are
+        // already logged and the user never accepted the suggestion (case 5).
+        $progressionAppliedWeight = $ex['progression_applied_weight'] ?? null;
+        $progressionApplied       = $progressionAppliedWeight !== null;
+        $workingTickedCount       = 0;
+        foreach ($existingSets as $_s) {
+            if (($_s['set_type'] ?? 'working') === 'working') $workingTickedCount++;
+        }
+        $allWorkingLogged = $workingTickedCount >= (int)($ex['target_sets'] ?? 0);
+        $hideSuggestion   = $allWorkingLogged && !$progressionApplied;
+
         // Column layout
         if ($exType === 'cardio') {
-            $colgroup = '<col style="width:70px;"><col><col style="width:36px;"><col style="width:36px;"><col style="width:32px;"><col style="width:44px;">';
+            $colgroup = '<col style="width:1fr;"><col style="width:1fr;"><col style="width:1fr;"><col style="width:1fr;"><col style="width:1fr;"><col style="width:44px;">';
             $thead    = '<th>TIME</th><th>KM</th><th><i class="bi bi-heart-pulse" title="Avg HR"></i></th><th><i class="bi bi-arrow-up-circle" title="Max HR"></i></th><th>INT</th><th></th>';
         } else {
             $kgLabel  = $exType === 'bodyweight' ? '+KG' : strtoupper($unit);
-            $colgroup = '<col style="width:28px;"><col style="width:64px;"><col><col><col style="width:52px;"><col style="width:44px;">';
-            $thead    = "<th>#</th><th>PREV</th><th>{$kgLabel}</th><th>REPS</th><th>RPE</th><th></th>";
+            $colgroup = '<col style="width:28px;"><col style="width:60px;"><col><col><col style="width:44px;"><col style="width:36px;"><col style="width:44px;">';
+            $thead    = "<th>#</th><th>PREV</th><th>{$kgLabel}</th><th>REPS</th><th>RPE</th><th></th><th></th>";
         }
 
         // PREV cell text builder
@@ -397,22 +515,28 @@ include __DIR__ . '/../core/page_head.php';
                         <?php endif; ?>
                     </div>
                     <div class="d-flex align-items-center">
-                        <?php if ($exType !== 'cardio'): ?>
+                        <?php if ($exType !== 'cardio' && warmup_icon_visible($ex['rest_category'] ?? '', $warmup_preset_exists)): ?>
                         <button class="btn-icon" onclick="openWarmupCalc(<?= $eid ?>)" type="button" aria-label="Warmup calculator" title="Warmup calculator">
                             <i class="bi bi-thermometer-half" style="font-size:1rem; color:#555;"></i>
                         </button>
                         <?php endif; ?>
+                        <button class="btn-icon" onclick="moveExercise(<?= $eid ?>, 'up')" type="button" aria-label="Move up">
+                            <i class="bi bi-chevron-up" style="font-size:0.9rem; color:#555;"></i>
+                        </button>
+                        <button class="btn-icon" onclick="moveExercise(<?= $eid ?>, 'down')" type="button" aria-label="Move down">
+                            <i class="bi bi-chevron-down" style="font-size:0.9rem; color:#555;"></i>
+                        </button>
                         <button class="btn-icon" onclick="removeExercise(<?= $eid ?>)" type="button" aria-label="Remove exercise">
                             <i class="bi bi-x-lg" style="font-size:1rem; color:#555;"></i>
                         </button>
                     </div>
                 </div>
 
-                <?php if (!empty($ex['suggestion']) && $ex['suggestion']['suggestion'] !== null): $sug = $ex['suggestion']; ?>
-                <div class="progression-hint mb-2"
-                     style="background:#1e1e1e; border-left:3px solid <?= $sug['increase'] ? '#FF5722' : '#555' ?>; padding:8px 10px; border-radius:0 4px 4px 0; cursor:pointer;"
-                     onclick="fillSuggestedWeight(<?= $eid ?>, <?= (float)$sug['suggestion'] ?>)"
-                     title="Tap to fill all sets with this weight">
+                <?php if (!empty($ex['suggestion']) && $ex['suggestion']['suggestion'] !== null && !$hideSuggestion): $sug = $ex['suggestion']; ?>
+                <div class="progression-hint mb-2<?= $progressionApplied ? ' applied' : '' ?>"
+                     style="background:#1e1e1e; border-left:3px solid <?= $sug['increase'] ? '#FF5722' : '#555' ?>; padding:8px 10px; border-radius:0 4px 4px 0; cursor:<?= $progressionApplied ? 'default' : 'pointer' ?>;<?= $progressionApplied ? ' opacity:0.5;' : '' ?>"
+                     <?php if (!$progressionApplied): ?>onclick="fillSuggestedWeight(<?= $eid ?>, <?= (float)$sug['suggestion'] ?>)"
+                     title="Tap to fill all sets with this weight"<?php endif; ?>>
                     <div style="font-size:0.68rem; color:#888; font-weight:700; letter-spacing:0.5px; text-transform:uppercase; margin-bottom:2px;">
                         <?= strtoupper($sug['scheme']) ?> PROGRESSION
                     </div>
@@ -425,7 +549,7 @@ include __DIR__ . '/../core/page_head.php';
                         </div>
                     </div>
                 </div>
-                <?php elseif (!empty($ex['suggestion'])): // first-time message ?>
+                <?php elseif (!empty($ex['suggestion']) && !$hideSuggestion): // first-time message ?>
                 <div class="mb-2" style="font-size:0.75rem; color:#555; padding:4px 2px;">
                     <i class="bi bi-info-circle me-1"></i><?= htmlspecialchars($ex['suggestion']['message']) ?>
                 </div>
@@ -443,7 +567,7 @@ include __DIR__ . '/../core/page_head.php';
                         $prevTxt = $mkPrev($p);
                         $stype  = htmlspecialchars($s['set_type']);
                     ?>
-                    <tr class="set-row ticked<?= $s['is_pr'] ? ' pr-flash' : '' ?>" data-set-id="<?= $s['id'] ?>" data-set-num="<?= $setNum ?>" data-set-type="<?= $stype ?>">
+                    <tr class="set-row ticked" data-set-id="<?= $s['id'] ?>" data-set-num="<?= $setNum ?>" data-set-type="<?= $stype ?>">
                         <?php if ($exType !== 'cardio'): ?>
                         <td class="set-num-cell"><span class="set-num" style="font-weight:900;font-size:.9rem;color:#888;"><?= $setNum ?></span></td>
                         <?php endif; ?>
@@ -460,13 +584,10 @@ include __DIR__ . '/../core/page_head.php';
                                    step="0.5" min="0" disabled></td>
                         <td><input type="number" class="input-set reps-input"   inputmode="numeric" value="<?= $s['reps'] ?? '' ?>" disabled></td>
                         <td><input type="number" class="input-set rpe-input"    inputmode="decimal" value="<?= $s['rpe'] ?? '' ?>" step="0.5" min="6" max="10" disabled></td>
+                        <td class="pr-cell"><?= $s['is_pr'] ? '<span class="pr-badge">PR</span>' : '' ?></td>
                         <?php endif; ?>
                         <td><button class="btn-tick btn-icon" onclick="tickSet(this)" type="button">
-                            <?php if ($s['is_pr']): ?>
-                            <i class="bi bi-trophy-fill" style="font-size:1.3rem; color:#FF5722;" title="PR!"></i>
-                            <?php else: ?>
                             <i class="bi bi-check-circle-fill" style="font-size:1.4rem;color:#4caf50;"></i>
-                            <?php endif; ?>
                         </button></td>
                     </tr>
                     <?php endforeach; ?>
@@ -492,19 +613,25 @@ include __DIR__ . '/../core/page_head.php';
                         <td><input type="number" class="input-set int-input"   inputmode="numeric" placeholder="—" min="1" max="10"
                                    value="<?= $p['intensity'] ?? '' ?>"></td>
                         <?php elseif ($exType === 'bodyweight'):
-                            $defAdded = $p ? ($p['added_weight_kg'] ?? '') : '';
+                            $defAdded = $progressionApplied
+                                ? $progressionAppliedWeight
+                                : ($p ? ($p['added_weight_kg'] ?? '') : '');
                         ?>
                         <td style="font-size:.78rem;color:#888;white-space:nowrap;"><?= $prevTxt ?></td>
                         <td><input type="number" class="input-set weight-input" inputmode="decimal" placeholder="0" value="<?= $defAdded ?>" step="0.5" min="0"></td>
                         <td><input type="number" class="input-set reps-input"   inputmode="numeric" placeholder="—" min="1" max="999"></td>
                         <td><input type="number" class="input-set rpe-input"    inputmode="decimal" placeholder="—" step="0.5" min="6" max="10"></td>
+                        <td class="pr-cell"></td>
                         <?php else:
-                            $defWeight = $p['weight_kg'] ?? '';
+                            $defWeight = $progressionApplied
+                                ? $progressionAppliedWeight
+                                : ($p['weight_kg'] ?? '');
                         ?>
                         <td style="font-size:.78rem;color:#888;white-space:nowrap;"><?= $prevTxt ?></td>
                         <td><input type="number" class="input-set weight-input" inputmode="decimal" placeholder="—" value="<?= $defWeight ?>" step="0.5" min="0"></td>
                         <td><input type="number" class="input-set reps-input"   inputmode="numeric" placeholder="—" min="1" max="999"></td>
                         <td><input type="number" class="input-set rpe-input"    inputmode="decimal" placeholder="—" step="0.5" min="6" max="10"></td>
+                        <td class="pr-cell"></td>
                         <?php endif; ?>
                         <td><button class="btn-tick btn-icon" onclick="tickSet(this)" type="button" aria-label="Log set">
                             <i class="bi bi-circle" style="font-size:1.4rem;color:#444;"></i>
@@ -576,21 +703,6 @@ include __DIR__ . '/../core/page_head.php';
 <!-- =========================================================
      FINISH WORKOUT MODAL
      ========================================================= -->
-<!-- Warmup Calculator Modal -->
-<div class="modal fade" id="warmupModal" tabindex="-1">
-    <div class="modal-dialog modal-dialog-centered">
-        <div class="modal-content">
-            <div class="modal-header" style="border-bottom:1px solid #333;">
-                <h5 class="modal-title fw-black uppercase" style="letter-spacing:-0.5px;">
-                    <i class="bi bi-thermometer-half me-2" style="color:#FF5722;"></i>WARMUP SETS
-                </h5>
-                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
-            </div>
-            <div class="modal-body" id="warmup-modal-body"></div>
-        </div>
-    </div>
-</div>
-
 <div class="modal fade" id="finishModal" tabindex="-1">
     <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
@@ -641,6 +753,22 @@ include __DIR__ . '/../core/page_head.php';
 <!-- =========================================================
      JAVASCRIPT
      ========================================================= -->
+
+<!-- Warmup Calculator Modal (present on all workout page states) -->
+<div class="modal fade" id="warmupModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header" style="border-bottom:1px solid #333;">
+                <h5 class="modal-title fw-black uppercase" style="letter-spacing:-0.5px;">
+                    <i class="bi bi-thermometer-half me-2" style="color:#FF5722;"></i>WARMUP SETS
+                </h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="warmup-modal-body"></div>
+        </div>
+    </div>
+</div>
+
 <?php if ($active): ?>
 <script>
 const WORKOUT_ID    = <?= (int)$active['id'] ?>;
@@ -727,7 +855,20 @@ function fillSuggestedWeight(exerciseId, weight) {
         input.value = weight;
     });
     const hint = block.querySelector('.progression-hint');
-    if (hint) { hint.style.opacity = '0.5'; hint.style.cursor = 'default'; hint.onclick = null; }
+    if (hint) {
+        hint.classList.add('applied');
+        hint.style.opacity = '0.5';
+        hint.style.cursor = 'default';
+        hint.onclick = null;
+        hint.removeAttribute('title');
+    }
+    // Persist so the applied state and prefilled weight survive page reload.
+    const fd = new FormData();
+    fd.append('action', 'apply_progression');
+    fd.append('workout_id', WORKOUT_ID);
+    fd.append('exercise_id', exerciseId);
+    fd.append('weight', weight);
+    fetch('/forge/core/api.php', { method: 'POST', body: fd }).catch(() => {});
 }
 
 // -------------------------------------------------------
@@ -736,7 +877,7 @@ function fillSuggestedWeight(exerciseId, weight) {
 function getPrevForSetNum(exerciseId, setNum) {
     const prev = prevSetsMap[exerciseId] || [];
     if (!prev.length) return null;
-    return prev[setNum - 1] || prev[prev.length - 1];
+    return prev[setNum - 1] ?? null;
 }
 
 function formatDurInput(input) {
@@ -790,9 +931,12 @@ async function tickSet(btn) {
 
     // Un-tick: re-enable editing
     if (row.classList.contains('ticked')) {
-        row.classList.remove('ticked', 'pr-flash');
+        row.classList.remove('ticked');
+        const prCellUntick = row.querySelector('.pr-cell');
+        if (prCellUntick) prCellUntick.innerHTML = '';
         row.querySelectorAll('input').forEach(i => { i.disabled = false; });
         btn.innerHTML = '<i class="bi bi-circle" style="font-size:1.4rem; color:#444;"></i>';
+        hideWorkoutDoneBar();
         return;
     }
 
@@ -857,19 +1001,122 @@ async function tickSet(btn) {
     row.querySelectorAll('input').forEach(i => { i.disabled = true; });
 
     if (result.is_pr) {
-        row.classList.add('pr-flash');
-        btn.innerHTML = '<i class="bi bi-trophy-fill" style="font-size:1.3rem; color:#FF5722;" title="New PR!"></i>';
+        const prCell = row.querySelector('.pr-cell');
+        if (prCell) prCell.innerHTML = '<span class="pr-badge">PR</span>';
+        btn.innerHTML = '<i class="bi bi-trophy-fill pr-trophy-anim" style="font-size:1.3rem; color:#FFD700;"></i>';
+        setTimeout(() => {
+            btn.innerHTML = '<i class="bi bi-check-circle-fill" style="font-size:1.4rem; color:#4caf50;"></i>';
+        }, 2000);
     } else {
         btn.innerHTML = '<i class="bi bi-check-circle-fill" style="font-size:1.4rem; color:#4caf50;"></i>';
     }
 
     if (exType !== 'cardio' && setType === 'working') {
-        const restCat  = block.dataset.restCategory || '';
-        const restSecs = REST_TIMES[restCat] ?? REST_DEFAULT;
-        startRestTimer(restSecs);
+        if (isWorkoutComplete()) {
+            skipRest();
+            showWorkoutDoneBar();
+        } else {
+            const restCat  = block.dataset.restCategory || '';
+            const restSecs = REST_TIMES[restCat] ?? REST_DEFAULT;
+            startRestTimer(restSecs);
+        }
     }
 
     updateBarNextUp();
+}
+
+// Returns true only when every exercise block has met its working-set target.
+function isWorkoutComplete() {
+    const blocks = document.querySelectorAll('.exercise-block');
+    if (!blocks.length) return false;
+    for (const block of blocks) {
+        const target = parseInt(block.dataset.targetSets || '0');
+        const done   = block.querySelectorAll('.set-row.ticked[data-set-type="working"]').length;
+        if (done < target) return false;
+    }
+    return true;
+}
+
+// Cancel rest timer and surface the green Finish button in the active bar.
+function showWorkoutDoneBar() {
+    skipRest();
+    const contBtn = document.getElementById('ab-continue-btn');
+    const doneBtn = document.getElementById('ab-done-btn');
+    if (contBtn) contBtn.style.display = 'none';
+    if (doneBtn) doneBtn.style.display = 'flex';
+}
+
+// Scroll so that block is visible, accounting for the sticky header and active bar.
+// mode='start' — always scroll the block to just below the header (new exercise).
+// mode='nearest' — only scroll if needed; prefers minimal movement (move up/down).
+function scrollToBlock(block, mode) {
+    const headerH = document.querySelector('.sticky-top')?.offsetHeight || 0;
+    const barH    = document.getElementById('active-bar')?.offsetHeight  || 0;
+    const GAP     = 12;
+
+    if (mode === 'start') {
+        const top = block.getBoundingClientRect().top + window.scrollY - headerH - GAP;
+        window.scrollTo({ top, behavior: 'smooth' });
+        return;
+    }
+
+    // nearest: only adjust if the block falls outside the visible safe zone
+    const rect    = block.getBoundingClientRect();
+    const safeTop = headerH + GAP;
+    const safeBot = window.innerHeight - barH - GAP;
+    if (rect.top < safeTop) {
+        window.scrollBy({ top: rect.top - safeTop, behavior: 'smooth' });
+    } else if (rect.bottom > safeBot) {
+        window.scrollBy({ top: rect.bottom - safeBot, behavior: 'smooth' });
+    }
+}
+
+// After appending a new exercise block, move it to just after the most recently
+// active exercise. If no sets have been ticked anywhere, leave it at the end.
+function smartInsertExercise(block) {
+    const container = document.getElementById('exercise-blocks');
+    let lastActiveBlock = null;
+    let highestId = -1;
+    container.querySelectorAll('.exercise-block').forEach(b => {
+        if (b === block) return;
+        b.querySelectorAll('.set-row.ticked').forEach(row => {
+            const sid = parseInt(row.dataset.setId || '0');
+            if (sid > highestId) { highestId = sid; lastActiveBlock = b; }
+        });
+    });
+    if (lastActiveBlock) lastActiveBlock.after(block);
+}
+
+// Move an exercise block one position up or down and persist the new order.
+function moveExercise(exerciseId, dir) {
+    const container = document.getElementById('exercise-blocks');
+    const blocks = [...container.querySelectorAll('.exercise-block')];
+    const block = container.querySelector(`.exercise-block[data-exercise-id="${exerciseId}"]`);
+    const idx = blocks.indexOf(block);
+    if (dir === 'up' && idx > 0) {
+        blocks[idx - 1].before(block);
+    } else if (dir === 'down' && idx < blocks.length - 1) {
+        blocks[idx + 1].after(block);
+    } else {
+        return; // already at edge
+    }
+    requestAnimationFrame(() => scrollToBlock(block, 'nearest'));
+    saveExerciseOrder();
+}
+
+// Persist the current DOM order of exercises to the database.
+function saveExerciseOrder() {
+    const ids = [...document.querySelectorAll('.exercise-block')].map(b => b.dataset.exerciseId);
+    api('reorder_workout_exercises', { workout_id: WORKOUT_ID, order: JSON.stringify(ids) });
+}
+
+// Reverse done state when a new set or exercise is added after completion.
+function hideWorkoutDoneBar() {
+    const doneBtn = document.getElementById('ab-done-btn');
+    if (!doneBtn || doneBtn.style.display === 'none') return;
+    doneBtn.style.display = 'none';
+    const contBtn = document.getElementById('ab-continue-btn');
+    if (contBtn) contBtn.style.display = 'flex';
 }
 
 // Update the bar's "next up" label live after each set tick (no page reload needed).
@@ -902,13 +1149,11 @@ function updateBarNextUp() {
         labelEl.textContent = `NEXT UP · SET ${tickedCount + 1} OF ${targetSets}`;
         nameEl.textContent  = name;
     } else {
-        // Try to find the next exercise block with remaining sets
-        const currentIdx = blocks.indexOf(lastBlock);
+        // Scan ALL blocks in order for the first with remaining working sets
         let found = false;
-        for (let i = currentIdx + 1; i < blocks.length; i++) {
-            const b  = blocks[i];
-            const bt = b.querySelectorAll('.set-row.ticked').length;
-            const bs = parseInt(b.dataset.targetSets || b.querySelectorAll('.set-row').length.toString() || '3');
+        for (const b of blocks) {
+            const bt = b.querySelectorAll('.set-row.ticked[data-set-type="working"]').length;
+            const bs = parseInt(b.dataset.targetSets || '0');
             if (bt < bs) {
                 const bn = b.querySelector('a.fw-black, span.fw-black')?.textContent?.trim() || '';
                 labelEl.style.color = '#FF5722';
@@ -922,6 +1167,7 @@ function updateBarNextUp() {
             labelEl.style.color = '#4caf50';
             labelEl.textContent = 'ALL SETS DONE';
             nameEl.textContent  = 'Finish workout?';
+            showWorkoutDoneBar();
         }
     }
 }
@@ -940,6 +1186,7 @@ function addSet(exerciseId) {
     row.dataset.setType = 'working';
 
     const numCell = `<td class="set-num-cell"><span class="set-num" style="font-weight:900;font-size:.9rem;color:#888;">${setNum}</span></td>`;
+    const prCell  = `<td class="pr-cell"></td>`;
     const tick    = `<td><button class="btn-tick btn-icon" onclick="tickSet(this)" type="button" aria-label="Log set"><i class="bi bi-circle" style="font-size:1.4rem;color:#444;"></i></button></td>`;
 
     if (exType === 'cardio') {
@@ -965,7 +1212,7 @@ function addSet(exerciseId) {
             + `<td><input type="number" class="input-set weight-input" inputmode="decimal" placeholder="0" value="${defAdded}" step="0.5" min="0"></td>`
             + `<td><input type="number" class="input-set reps-input"   inputmode="numeric" placeholder="—" min="1" max="999"></td>`
             + `<td><input type="number" class="input-set rpe-input"    inputmode="decimal" placeholder="—" step="0.5" min="6" max="10"></td>`
-            + tick;
+            + prCell + tick;
         setupLongPress(row);
         tbody.appendChild(row);
         row.querySelector('.reps-input').focus();
@@ -977,12 +1224,15 @@ function addSet(exerciseId) {
             + `<td><input type="number" class="input-set weight-input" inputmode="decimal" placeholder="—" value="${defWeight}" step="0.5" min="0"></td>`
             + `<td><input type="number" class="input-set reps-input"   inputmode="numeric" placeholder="—" min="1" max="999"></td>`
             + `<td><input type="number" class="input-set rpe-input"    inputmode="decimal" placeholder="—" step="0.5" min="6" max="10"></td>`
-            + tick;
+            + prCell + tick;
         setupLongPress(row);
         tbody.appendChild(row);
         row.querySelector('.weight-input').focus();
     }
+    hideWorkoutDoneBar();
     syncExerciseTargetSets(block);
+    // Keep the button bar in viewport — scroll by the actual rendered row height
+    requestAnimationFrame(() => window.scrollBy({ top: row.offsetHeight, behavior: 'instant' }));
 }
 
 function addDropSet(exerciseId) {
@@ -1010,6 +1260,7 @@ function addDropSet(exerciseId) {
     row.dataset.setType = 'dropset';
 
     const numCell = `<td class="set-num-cell"><span class="set-num" style="font-weight:900;font-size:.9rem;color:#ce93d8;">${setNum}</span></td>`;
+    const prCell  = `<td class="pr-cell"></td>`;
     const tick    = `<td><button class="btn-tick btn-icon" onclick="tickSet(this)" type="button" aria-label="Log set"><i class="bi bi-circle" style="font-size:1.4rem;color:#444;"></i></button></td>`;
 
     if (exType === 'bodyweight') {
@@ -1018,19 +1269,20 @@ function addDropSet(exerciseId) {
             + `<td><input type="number" class="input-set weight-input" inputmode="decimal" placeholder="0" value="${suggestedWeight}" step="0.5" min="0"></td>`
             + `<td><input type="number" class="input-set reps-input"   inputmode="numeric" placeholder="—" min="1" max="999"></td>`
             + `<td><input type="number" class="input-set rpe-input"    inputmode="decimal" placeholder="—" step="0.5" min="6" max="10"></td>`
-            + tick;
+            + prCell + tick;
     } else {
         row.innerHTML = numCell
             + `<td style="font-size:.78rem;color:#888;white-space:nowrap;">DROP</td>`
             + `<td><input type="number" class="input-set weight-input" inputmode="decimal" placeholder="—" value="${suggestedWeight}" step="0.5" min="0"></td>`
             + `<td><input type="number" class="input-set reps-input"   inputmode="numeric" placeholder="—" min="1" max="999"></td>`
             + `<td><input type="number" class="input-set rpe-input"    inputmode="decimal" placeholder="—" step="0.5" min="6" max="10"></td>`
-            + tick;
+            + prCell + tick;
     }
 
     setupLongPress(row);
     tbody.appendChild(row);
     row.querySelector('.weight-input').focus();
+    hideWorkoutDoneBar();
     syncExerciseTargetSets(block);
 }
 
@@ -1039,6 +1291,11 @@ async function deleteLastSet(exerciseId) {
     const tbody = block.querySelector('.set-tbody');
     const rows  = tbody.querySelectorAll('tr');
     if (!rows.length) return;
+    // Single set = delete the whole exercise (removes the exercise and shows confirm dialog)
+    if (rows.length === 1) {
+        removeExercise(exerciseId);
+        return;
+    }
     const last = rows[rows.length - 1];
     await deleteSetRow(last);
 }
@@ -1048,26 +1305,43 @@ async function deleteLastSet(exerciseId) {
 // -------------------------------------------------------
 function floorTo2_5(v) { return Math.floor(v / 2.5) * 2.5; }
 
-function buildWarmupSets(isBarbell, working) {
-    const s2 = floorTo2_5(working * 0.50);
-    const s3 = floorTo2_5(working * 0.80);
-    const sets = isBarbell
-        ? [{ w: '20kg (bar)', r: 8, note: 'empty bar' },
-           { w: s2 + 'kg',    r: 5, note: '50%' },
-           { w: s3 + 'kg',    r: 3, note: '80%' }]
-        : [{ w: floorTo2_5(working * 0.30) + 'kg', r: 8, note: '30%' },
-           { w: s2 + 'kg', r: 5, note: '50%' },
-           { w: s3 + 'kg', r: 3, note: '80%' }];
+// Warmup presets: stored in user_settings as JSON arrays keyed by rest_category.
+// Each row: { pct: number|null, reps: number }
+// pct=null → empty bar (user fills in weight manually in workout).
+// pct is % of working weight; reps is rep count.
+const WARMUP_KEYS = {
+    'compound_big4': 'compound',
+    'compound':      'compound',
+    'isolation':     'accessory',
+};
+
+function buildWarmupSets(restCategory, working) {
+    const key = WARMUP_KEYS[restCategory] || 'compound';
+    const presets = Array.isArray(window.forgeWarmupPresets?.[key]) ? window.forgeWarmupPresets[key] : null;
 
     let html = `<div class="stat-label mb-3">WORKING: <span style="font-family:monospace;color:#fff;">${working}kg</span></div>`;
-    sets.forEach((s, i) => {
+
+    if (!presets || !presets.length) {
+        html += `<div class="text-muted text-center py-3" style="font-size:.8rem;">No warmup defined in Settings</div>`;
+        return html;
+    }
+
+    presets.forEach((s, i) => {
+        let weightStr = '';
+        if (s.pct == null) {
+            weightStr = '20kg <span style="color:#888;font-size:.8rem;">(bar)</span>';
+        } else if (s.pct != null) {
+            const w = floorTo2_5(working * s.pct / 100);
+            weightStr = `${w}kg <span style="color:#888;font-size:.8rem;">(${s.pct}%)</span>`;
+        } else {
+            weightStr = '—';
+        }
         html += `<div class="d-flex align-items-center justify-content-between py-2" style="border-bottom:1px solid #2a2a2a;">
             <div>
                 <span class="stat-label">SET ${i + 1}</span>
-                <span class="text-muted" style="font-size:.7rem;margin-left:6px;">${s.note}</span>
             </div>
             <div style="font-family:monospace;font-weight:900;font-size:1rem;color:#e0e0e0;">
-                ${s.w} <span style="color:#888;font-size:.85rem;">× ${s.r}</span>
+                ${weightStr} <span style="color:#888;font-size:.85rem;">× ${s.reps}</span>
             </div>
         </div>`;
     });
@@ -1076,7 +1350,7 @@ function buildWarmupSets(isBarbell, working) {
 
 function openWarmupCalc(exerciseId) {
     const block      = document.querySelector(`.exercise-block[data-exercise-id="${exerciseId}"]`);
-    const isBarbell  = (block.dataset.category || '') === 'Barbell';
+    const restCat    = block.dataset.restCategory || 'compound';
 
     // Find working weight: first working-set weight input with a value
     let working = null;
@@ -1087,7 +1361,7 @@ function openWarmupCalc(exerciseId) {
 
     const body = document.getElementById('warmup-modal-body');
     if (working && working > 0) {
-        body.innerHTML = buildWarmupSets(isBarbell, working)
+        body.innerHTML = buildWarmupSets(restCat, working)
             + `<div class="mt-3 d-flex gap-2 align-items-center">
                 <input type="number" id="warmup-override" class="form-control" inputmode="decimal"
                        placeholder="Different weight?" style="max-width:160px;" value="${working}">
@@ -1107,21 +1381,21 @@ function openWarmupCalc(exerciseId) {
 }
 
 function recalcWarmup(exerciseId) {
-    const block     = document.querySelector(`.exercise-block[data-exercise-id="${exerciseId}"]`);
-    const isBarbell = (block.dataset.category || '') === 'Barbell';
-    const inp       = document.getElementById('warmup-override');
-    const working   = parseFloat(inp.value);
+    const block   = document.querySelector(`.exercise-block[data-exercise-id="${exerciseId}"]`);
+    const restCat = block.dataset.restCategory || 'compound';
+    const inp     = document.getElementById('warmup-override');
+    const working = parseFloat(inp.value);
     if (isNaN(working) || working <= 0) { inp.style.borderColor = '#ff4444'; return; }
     inp.style.borderColor = '';
 
     const out = document.getElementById('warmup-sets-out');
     if (out) {
         // Inline recalc (no-working-weight path)
-        out.innerHTML = buildWarmupSets(isBarbell, working);
+        out.innerHTML = buildWarmupSets(restCat, working);
     } else {
         // Replace full body (had-working-weight path)
         document.getElementById('warmup-modal-body').innerHTML =
-            buildWarmupSets(isBarbell, working)
+            buildWarmupSets(restCat, working)
             + `<div class="mt-3 d-flex gap-2 align-items-center">
                 <input type="number" id="warmup-override" class="form-control" inputmode="decimal"
                        placeholder="Different weight?" style="max-width:160px;" value="${working}">
@@ -1133,6 +1407,7 @@ function recalcWarmup(exerciseId) {
 async function deleteSetRow(row) {
     const setId = row.dataset.setId;
     const block = row.closest('.exercise-block');
+    const rowH  = row.offsetHeight;
     if (setId) {
         await api('delete_set', { set_id: setId, workout_id: WORKOUT_ID });
     }
@@ -1145,6 +1420,8 @@ async function deleteSetRow(row) {
         if (n) n.textContent = i + 1;
     });
     syncExerciseTargetSets(block);
+    // Keep the button bar in viewport — scroll up by the actual deleted row height
+    requestAnimationFrame(() => window.scrollBy({ top: -rowH, behavior: 'instant' }));
 }
 
 function setupLongPress(row) {
@@ -1294,14 +1571,14 @@ function addExerciseBlock(ex) {
 
     let colgroup, thead;
     if (exType === 'cardio') {
-        colgroup = '<col><col style="width:44px;"><col style="width:36px;"><col style="width:36px;"><col style="width:36px;"><col style="width:44px;">';
+        colgroup = '<col style="width:1fr;"><col style="width:1fr;"><col style="width:1fr;"><col style="width:1fr;"><col style="width:1fr;"><col style="width:44px;">';
         thead    = '<th>TIME</th><th>KM</th><th><i class="bi bi-heart-pulse"></i></th><th><i class="bi bi-arrow-up-circle"></i></th><th>INT</th><th></th>';
     } else if (exType === 'bodyweight') {
-        colgroup = '<col style="width:28px;"><col style="width:64px;"><col><col><col style="width:52px;"><col style="width:44px;">';
-        thead    = '<th>#</th><th>PREV</th><th>+KG</th><th>REPS</th><th>RPE</th><th></th>';
+        colgroup = '<col style="width:28px;"><col style="width:60px;"><col><col><col style="width:44px;"><col style="width:36px;"><col style="width:44px;">';
+        thead    = '<th>#</th><th>PREV</th><th>+KG</th><th>REPS</th><th>RPE</th><th></th><th></th>';
     } else {
-        colgroup = '<col style="width:28px;"><col style="width:64px;"><col><col><col style="width:52px;"><col style="width:44px;">';
-        thead    = `<th>#</th><th>PREV</th><th>${UNIT.toUpperCase()}</th><th>REPS</th><th>RPE</th><th></th>`;
+        colgroup = '<col style="width:28px;"><col style="width:60px;"><col><col><col style="width:44px;"><col style="width:28px;"><col style="width:44px;">';
+        thead    = `<th>#</th><th>PREV</th><th>${UNIT.toUpperCase()}</th><th>REPS</th><th>RPE</th><th></th><th></th>`;
     }
 
     const block = document.createElement('div');
@@ -1322,9 +1599,15 @@ function addExerciseBlock(ex) {
                         ${muscleBadge}${bwHint}
                     </div>
                     <div class="d-flex align-items-center">
-                        ${exType !== 'cardio' ? `<button class="btn-icon" onclick="openWarmupCalc(${ex.id})" type="button" title="Warmup calculator">
+                        ${exType !== 'cardio' && ex.rest_category !== 'bodyweight' && window.forgeWarmupPresets?.[WARMUP_KEYS[ex.rest_category || '']] ? `<button class="btn-icon" onclick="openWarmupCalc(${ex.id})" type="button" title="Warmup calculator">
                             <i class="bi bi-thermometer-half" style="font-size:1rem;color:#555;"></i>
                         </button>` : ''}
+                        <button class="btn-icon" onclick="moveExercise(${ex.id}, 'up')" type="button" aria-label="Move up">
+                            <i class="bi bi-chevron-up" style="font-size:0.9rem;color:#555;"></i>
+                        </button>
+                        <button class="btn-icon" onclick="moveExercise(${ex.id}, 'down')" type="button" aria-label="Move down">
+                            <i class="bi bi-chevron-down" style="font-size:0.9rem;color:#555;"></i>
+                        </button>
                         <button class="btn-icon" onclick="removeExercise(${ex.id})" type="button">
                             <i class="bi bi-x-lg" style="font-size:1rem;color:#555;"></i>
                         </button>
@@ -1354,8 +1637,12 @@ function addExerciseBlock(ex) {
         </div>`;
 
     document.getElementById('exercise-blocks').appendChild(block);
+    smartInsertExercise(block);
+    hideWorkoutDoneBar();
+    // Scroll to the inserted block after the modal dismiss animation completes (~300ms)
+    setTimeout(() => requestAnimationFrame(() => scrollToBlock(block, 'start')), 300);
 
-    const orderNum = document.querySelectorAll('.exercise-block').length - 1;
+    const orderNum = [...document.querySelectorAll('.exercise-block')].indexOf(block);
     api('add_workout_exercise', { workout_id: WORKOUT_ID, exercise_id: ex.id, order_num: orderNum, target_sets: 3 });
 
     api('get_last_exercise_sets', { exercise_id: ex.id, workout_id: WORKOUT_ID })
@@ -1375,6 +1662,7 @@ document.getElementById('addExerciseModal').addEventListener('show.bs.modal', ()
 // Finish workout
 // -------------------------------------------------------
 function openFinishModal() {
+    skipRest();
     const tickedRows     = document.querySelectorAll('.set-row.ticked');
     const exerciseBlocks = document.querySelectorAll('.exercise-block');
 
@@ -1391,6 +1679,7 @@ async function cancelWorkout() {
         ? `Cancel workout? ${tickedCount} logged set(s) will be deleted.`
         : 'Cancel this workout?';
     if (!confirm(msg)) return;
+    skipRest();
     const r = await api('delete_workout', { id: WORKOUT_ID });
     if (r.status === 'success') window.location.href = '/forge/';
     else alert('Error: ' + r.message);
@@ -1421,50 +1710,6 @@ async function confirmFinish() {
 </script>
 <?php else: ?>
 <script>
-let editMode = false;
-function toggleEditMode() {
-    editMode = !editMode;
-    const btn = document.getElementById('edit-mode-btn');
-    btn.style.color       = editMode ? '#FF5722' : '#666';
-    btn.style.borderColor = editMode ? '#FF5722' : '#333';
-    document.querySelectorAll('.edit-mode-icon').forEach(el => el.classList.toggle('d-none', !editMode));
-    document.querySelectorAll('.edit-mode-delete').forEach(el => el.classList.toggle('d-none', !editMode));
-}
-
-document.querySelectorAll('.template-form').forEach(form => {
-    form.addEventListener('submit', function(e) {
-        if (editMode) {
-            e.preventDefault();
-            window.location.href = '/forge/templates/?id=' + this.dataset.templateId;
-        }
-    });
-});
-
-document.querySelectorAll('.edit-mode-delete').forEach(icon => {
-    icon.addEventListener('click', async (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        if (!editMode) return;
-        const templateId = parseInt(icon.dataset.deleteTemplateId || '0', 10);
-        if (!templateId) return;
-        if (!confirm('Delete this template? Past workouts stay in history.')) return;
-
-        const fd = new FormData();
-        fd.append('action', 'delete_template');
-        fd.append('id', String(templateId));
-        const r = await fetch('/forge/core/api.php', { method: 'POST', body: fd }).then(res => res.json());
-        if (r.status === 'success') {
-            icon.closest('.template-form')?.remove();
-            if (!document.querySelector('.template-form')) {
-                const list = document.getElementById('template-list');
-                if (list) list.innerHTML = '<div class="text-muted small text-center py-3" style="color:#444;">No templates yet</div>';
-            }
-        } else {
-            alert('Error: ' + (r.message || 'Failed to delete template'));
-        }
-    });
-});
-
 function openNewTemplateModal() {
     document.getElementById('new-template-name').value = '';
     new bootstrap.Modal(document.getElementById('newTemplateModal')).show();

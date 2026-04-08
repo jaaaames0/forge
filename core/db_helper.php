@@ -105,6 +105,9 @@ function maybe_migrate_schema(PDO $db): void {
     if (!in_array('target_sets', $we_cols)) {
         $db->exec("ALTER TABLE workout_exercises ADD COLUMN target_sets INTEGER DEFAULT 3");
     }
+    if (!in_array('progression_applied_weight', $we_cols)) {
+        $db->exec("ALTER TABLE workout_exercises ADD COLUMN progression_applied_weight REAL DEFAULT NULL");
+    }
 
     // cardio_records table
     $db->exec("CREATE TABLE IF NOT EXISTS cardio_records (
@@ -159,10 +162,11 @@ function set_user_setting(PDO $db, string $key, string $value): void {
 }
 
 /**
- * Epley 1RM estimate. Only valid for reps > 1 and reps <= 12.
+ * Epley 1RM estimate. Valid for reps > 1 and reps <= 30.
+ * Formula accuracy degrades above ~12 reps but remains consistent for relative PR comparison.
  */
 function estimate_1rm(float $weight, int $reps, string $formula = 'epley'): ?float {
-    if ($reps <= 1 || $reps > 12 || $weight <= 0) return null;
+    if ($reps <= 1 || $reps > 30 || $weight <= 0) return null;
     if ($formula === 'brzycki') {
         return round($weight / (1.0278 - 0.0278 * $reps), 1);
     }
@@ -190,7 +194,7 @@ function maybe_update_pr(PDO $db, int $exercise_id, float $weight_kg, int $reps,
 }
 
 /**
- * Check cardio PRs (avg_speed, cardiac_efficiency, best_distance) after a cardio set.
+ * Check cardio PRs (avg_speed, cardiac_efficiency, best_distance, best_duration) after a cardio set.
  * Returns array of record_type strings that were newly set, empty if no PRs.
  */
 function maybe_update_cardio_pr(PDO $db, int $exercise_id, ?int $duration_sec, ?float $distance_km, ?int $hr_avg, ?int $intensity): array {
@@ -210,6 +214,7 @@ function maybe_update_cardio_pr(PDO $db, int $exercise_id, ?int $duration_sec, ?
     if ($avg_speed  !== null) $metrics['avg_speed']           = $avg_speed;
     if ($efficiency !== null) $metrics['cardiac_efficiency']  = $efficiency;
     if ($distance_km > 0)     $metrics['best_distance']       = $distance_km;
+    if ($duration_sec > 0)    $metrics['best_duration']      = $duration_sec; // longest continuous effort
 
     $check  = $db->prepare("SELECT value FROM cardio_records WHERE exercise_id=? AND record_type=? ORDER BY value DESC LIMIT 1");
     $insert = $db->prepare("INSERT INTO cardio_records (exercise_id, record_type, value, duration_sec, distance_km, avg_hr, intensity) VALUES (?,?,?,?,?,?,?)");
@@ -217,7 +222,8 @@ function maybe_update_cardio_pr(PDO $db, int $exercise_id, ?int $duration_sec, ?
     foreach ($metrics as $type => $value) {
         $check->execute([$exercise_id, $type]);
         $current = $check->fetchColumn();
-        if ($current === false || $value > (float)$current) {
+        $is_duration = ($type === 'best_duration');
+        if ($current === false || ($is_duration ? $value > (float)$current : $value > (float)$current)) {
             $insert->execute([$exercise_id, $type, $value, $duration_sec, $distance_km, $hr_avg, $intensity]);
             $new_prs[] = $type;
         }
@@ -294,7 +300,7 @@ function compute_progression_suggestion(PDO $db, array $te): ?array {
             $increase   = true;
             $message    = "All {$target_sets} sets hit {$reps_max} — add {$increment}kg, aim {$reps_min}+";
         } else {
-            $message = "Push for {$reps_max} reps on all {$target_sets} sets (last best: {$min_reps})";
+            $message = "Push for {$reps_max} reps on all {$target_sets} sets";
         }
 
     } elseif ($scheme === 'rpe') {

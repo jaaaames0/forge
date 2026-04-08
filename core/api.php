@@ -49,9 +49,12 @@ try {
         $secondary = $_POST['muscle_secondary'] ?? null;
         $notes     = $_POST['notes'] ?? null;
         if (!$id || !$name) throw new Exception('ID and name required');
+        $rest_cat  = $_POST['rest_category'] ?? null;
+        $valid_rest = ['compound_big4', 'compound', 'bodyweight', 'isolation'];
+        if ($rest_cat && !in_array($rest_cat, $valid_rest)) $rest_cat = null;
 
-        $db->prepare("UPDATE exercises SET name=?, category=?, muscle_primary=?, muscle_secondary=?, notes=? WHERE id=? AND is_custom=1")
-           ->execute([$name, $category, $primary, $secondary, $notes, $id]);
+        $db->prepare("UPDATE exercises SET name=?, category=?, muscle_primary=?, muscle_secondary=?, rest_category=?, notes=? WHERE id=?")
+           ->execute([$name, $category, $primary, $secondary, $rest_cat ?: null, $notes, $id]);
         echo json_encode(['status' => 'success']);
 
     } elseif ($action === 'delete_exercise') {
@@ -305,12 +308,12 @@ try {
                 // $set_id is 0 for new inserts (so id != 0 excludes nothing — the new row
                 // isn't in the DB yet). For updates, $set_id excludes the current row.
                 $chk2 = $db->prepare("
-                    SELECT MAX(weight_kg * (1.0 + reps / 30.0))
+                    SELECT MAX(ROUND(weight_kg * (1.0 + reps / 30.0), 1))
                     FROM workout_sets
                     WHERE exercise_id = ? AND workout_id = ? AND id != ?
                       AND set_type = 'working'
                       AND weight_kg IS NOT NULL AND reps IS NOT NULL
-                      AND reps > 1 AND reps <= 12
+                      AND reps > 1 AND reps <= 30
                 ");
                 $chk2->execute([$exercise_id, $workout_id, $set_id ?: 0]);
                 $session_best = $chk2->fetchColumn();
@@ -479,6 +482,29 @@ try {
         $db->prepare("DELETE FROM template_exercises WHERE id=?")->execute([$id]);
         echo json_encode(['status' => 'success']);
 
+    } elseif ($action === 'apply_progression') {
+        // Persist that the user accepted a progression suggestion for this exercise
+        // in this workout. Stored on workout_exercises so it survives page reload.
+        // Pass weight='' to clear (currently unused).
+        $workout_id  = (int)($_POST['workout_id'] ?? 0);
+        $exercise_id = (int)($_POST['exercise_id'] ?? 0);
+        $weight      = $_POST['weight'] ?? '';
+        if (!$workout_id || !$exercise_id) throw new Exception('workout_id and exercise_id required');
+        $w = $weight === '' ? null : (float)$weight;
+        $db->prepare("UPDATE workout_exercises SET progression_applied_weight=? WHERE workout_id=? AND exercise_id=?")
+           ->execute([$w, $workout_id, $exercise_id]);
+        echo json_encode(['status' => 'success']);
+
+    } elseif ($action === 'reorder_workout_exercises') {
+        $workout_id = (int)($_POST['workout_id'] ?? 0);
+        $order = json_decode($_POST['order'] ?? '[]', true);
+        if (!$workout_id || !is_array($order)) throw new Exception('workout_id and order required');
+        $stmt = $db->prepare("UPDATE workout_exercises SET order_num=? WHERE workout_id=? AND exercise_id=?");
+        foreach ($order as $i => $eid) {
+            $stmt->execute([$i + 1, $workout_id, (int)$eid]);
+        }
+        echo json_encode(['status' => 'success']);
+
     } elseif ($action === 'reorder_template_exercises') {
         // Expects $_POST['order'] as JSON array of ids in new order
         $order = json_decode($_POST['order'] ?? '[]', true);
@@ -506,7 +532,8 @@ try {
         $value = $_POST['value'] ?? '';
         $allowed = ['rest_compound_big4_sec', 'rest_compound_sec', 'rest_bodyweight_sec', 'rest_isolation_sec',
                     'profile_name', 'profile_sex', 'profile_dob', 'profile_height_cm',
-                    'profile_resting_hr', 'profile_max_hr'];
+                    'profile_resting_hr', 'profile_max_hr',
+                    'warmup_presets_compound', 'warmup_presets_bodyweight', 'warmup_presets_accessory'];
         if (!in_array($key, $allowed)) throw new Exception('Unknown setting key');
         set_user_setting($db, $key, $value);
         echo json_encode(['status' => 'success']);
@@ -538,15 +565,18 @@ try {
             SELECT ws.set_number, ws.weight_kg, ws.added_weight_kg, ws.reps, ws.rpe,
                    ws.set_type, ws.duration_sec, ws.distance_km, ws.hr_avg, ws.hr_max, ws.intensity
             FROM workout_sets ws
-            JOIN workouts w ON w.id = ws.workout_id
             WHERE ws.exercise_id = ?
               AND ws.set_type = 'working'
-              AND w.finished_at IS NOT NULL
-              AND (? = 0 OR w.id != ?)
-            ORDER BY w.finished_at DESC, ws.set_number ASC
-            LIMIT 10
+              AND ws.workout_id = (
+                  SELECT w2.id FROM workouts w2
+                  JOIN workout_sets ws2 ON ws2.workout_id = w2.id
+                  WHERE ws2.exercise_id = ? AND w2.finished_at IS NOT NULL
+                    AND (? = 0 OR w2.id != ?)
+                  ORDER BY w2.finished_at DESC LIMIT 1
+              )
+            ORDER BY ws.set_number ASC
         ");
-        $stmt->execute([$exercise_id, $workout_id, $workout_id]);
+        $stmt->execute([$exercise_id, $exercise_id, $workout_id, $workout_id]);
         echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
 
     } else {

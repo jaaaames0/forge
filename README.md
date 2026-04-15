@@ -2,7 +2,7 @@
 
 Self-hosted gym and workout tracking web app. Built for personal use on a phone at the gym. Sister app to [SPENCE](../spence/).
 
-Current release: **v0.3.0**.
+Current release: **v0.4.0**.
 
 ![PHP](https://img.shields.io/badge/PHP-8.2+-777BB4?logo=php&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-3-003B57?logo=sqlite&logoColor=white)
@@ -20,7 +20,10 @@ Current release: **v0.3.0**.
 - Exercise stats: best sets, estimated 1RM history, volume trends
 - Full session history per exercise
 - Body composition tracking (waist/neck/hip measurements, Navy BF% formula)
-- Cardio tracking (time, distance, heart rate, cardiac efficiency)
+- Live cardio sessions with stopwatch, HR zone display, and finish modal (distance, elevation, intensity)
+- Cardio PRs: best distance, best speed, cardiac efficiency
+- Web Bluetooth HR monitor integration — pairs once, auto-reconnects; live BPM in workout header, per-set %HRR badges, session HR timeline in history
+- Resting and max HR capture with historical trend charts on profile
 - Installable as a PWA (Add to Home Screen on Android/iOS)
 
 ## Tech stack
@@ -113,7 +116,8 @@ exercises/      Exercise library + individual stats
 history/        Session history + per-exercise history
 progress/       e1RM trends, volume, body comp, cardio PRs
 profile/        User profile + body metrics + rest alert toggles
-settings/       Reserved for future app-level settings
+hr/             Web Bluetooth HR monitor tech demo
+settings/       Redirects to profile (settings were moved in v0.3.0)
 sw.js           Service worker for background rest notifications
 database/       schema.sql, forge_empty.db (forge.db is gitignored)
 ```

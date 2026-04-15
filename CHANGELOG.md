@@ -2,6 +2,30 @@
 
 All notable changes to FORGE are documented here.
 
+## v0.4.0 — 2026-04-16
+
+### Added
+- **Web Bluetooth HR monitor integration** — connect a BLE heart rate monitor once (tested with CooSpo H808S, works with any standard GATT HR Service device) and FORGE reconnects automatically on every page load via `getDevices()` with exponential-backoff retry on dropout. Profile → BIOMETRICS adds MEASURE buttons: resting HR collects a 30-second average; max HR tracks peak BPM during a go-hard effort and auto-saves on disconnect. Profile → TRENDS shows Chart.js history charts for bodyweight, resting HR, and max HR (shown once ≥ 2 data points exist). A standalone tech demo is available at `/forge/hr/`.
+- **Live HR in workout + per-set capture** — BLE badge in the workout header streams live BPM and stores one sample every 5 s. On each set tick, peak BPM from the last 20 s is saved to `workout_sets.hr_max` and shown as a Karvonen %HRR badge (or raw BPM fallback). Workout history detail shows a Chart.js HR timeline with set-completion markers overlaid and a session min / avg / max header. Individual exercise pages surface %HRR history when data is available.
+- **Cardio workout mode** — start screen split into LIFT and CARDIO buttons; CARDIO reveals an inline exercise picker. Cardio sessions get a dedicated page: full-screen stopwatch persisted in `localStorage` (survives refresh without drifting), live BPM display, HR zone label and animated fill bar, Karvonen %HRR chip. Screen wake lock (`navigator.wakeLock`) prevents the phone sleeping mid-session. Finish modal captures distance (km), elevation gain (m), perceived intensity (1–10), bodyweight, and notes; avg/max HR are auto-computed from stored samples. History list and detail differentiate cardio sessions with a CARDIO badge and DIST / ELEV / INT stat chips.
+- **PR board on `/progress`** now ranks by number of PRs recorded per exercise (most PRs first, then most recent PR date), and displays the PR count on each row.
+
+### Changed
+- Active bar "Next up" hint now shows the last logged weight (or the pre-filled previous-session weight for the first set) alongside the exercise name, so target weight is visible without scrolling to the set table.
+- Strength exercise picker (add exercise during active workout) now filters out Cardio-category exercises.
+
+### Fixed
+- **A/B template split counter advancing on cancelled workouts** — the A/B variant was written to the template on first page load (exercise seed time), so starting then cancelling a workout would desync the sequence. The variant is now stored on the workout row and only committed to the template when the workout is actually finished.
+- **A/B split leaking exercises into both variants** — exercises with `ab_group = ''` (empty string from older data) were not matched by the `IS NULL` guard and appeared in both A and B groups. Fixed with an additional `OR ab_group = ''` guard.
+- **Rest notification double-fire** — when the rest timer expired with the app in the background, both the service worker and the page client could fire a notification. Page client now only plays the bell and cancels the SW timer when the app is visible; the SW handles background notifications exclusively.
+- **Rest notification not dismissing on screen unlock** — `CLOSE_NOTIFICATION` messages were sent to the service worker but the handler was missing. SW now correctly closes notifications by tag when the user returns to FORGE.
+- **Active bar weight/reps hint disappearing after logging a set** — `updateBarNextUp()` used a selector (`input[data-field="weight"]`) that matched nothing; the hint was always blank from JS, overwriting the server-rendered value on every tick. Fixed selector to `.weight-input`, added `data-reps-min`/`data-reps-max` to the exercise block, and rebuilt the hint to match the PHP format ("87.5 kg × 3–5") consistently without a page reload.
+
+### Schema
+- Added `workout_hr_samples (id, workout_id, sampled_at, bpm)` and `hr_measurements (id, type, bpm, measured_at)` tables.
+- Added `workouts.type TEXT DEFAULT 'strength'` (`'strength'` | `'cardio'`) and `workouts.ab_variant TEXT` (which A/B group this session used — written to templates only on finish).
+- Added `workout_sets.logged_at TEXT` (set-tick timestamp for HR chart overlays), `workout_sets.elevation_m REAL`, `workout_sets.is_pr INTEGER DEFAULT 0`, `workout_exercises.target_sets INTEGER`, `workout_exercises.progression_applied_weight REAL`.
+
 ## v0.3.0 - 2026-04-08
 
 ### Added

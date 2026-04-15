@@ -268,10 +268,14 @@ if (!empty($_ab_rows)) {
                 btnsEl.style.display = 'none';
                 document.body.classList.remove('workout-bar-timer');
                 localStorage.removeItem(TIMER_KEY);
-                swPost({ type: 'CANCEL_TIMER' });
-                navigator.vibrate && navigator.vibrate([200, 100, 200]);
-                playBell();
-                notifyRestDone();
+                // If page is visible: cancel SW timer (user can see timer done), play bell.
+                // If page is hidden: leave SW timer — it fires the notification independently.
+                // This avoids a double-notification race between client and SW.
+                if (document.visibilityState === 'visible') {
+                    swPost({ type: 'CANCEL_TIMER' });
+                    navigator.vibrate && navigator.vibrate([200, 100, 200]);
+                    playBell();
+                }
             }
         }
         tick();

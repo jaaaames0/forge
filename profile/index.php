@@ -62,6 +62,22 @@ if ($navy_bf !== null && $caliper_bf !== null) {
 $lean_kg = ($smoothed_bf !== null && $bw) ? round($bw * (1 - $smoothed_bf / 100), 1) : null;
 $fat_kg  = ($smoothed_bf !== null && $bw) ? round($bw * ($smoothed_bf / 100), 1)       : null;
 
+// ── TREND DATA ─────────────────────────────────────────────────────────────
+$bw_history = $db->query("
+    SELECT bodyweight_kg, DATE(started_at) AS date
+    FROM workouts
+    WHERE bodyweight_kg IS NOT NULL AND bodyweight_kg > 0
+    ORDER BY started_at ASC
+")->fetchAll(PDO::FETCH_ASSOC);
+
+$hr_rows = $db->query("
+    SELECT type, bpm, DATE(measured_at) AS date
+    FROM hr_measurements
+    ORDER BY measured_at ASC
+")->fetchAll(PDO::FETCH_ASSOC);
+$resting_hr_history = array_values(array_filter($hr_rows, fn($r) => $r['type'] === 'resting'));
+$max_hr_history     = array_values(array_filter($hr_rows, fn($r) => $r['type'] === 'max'));
+
 // ── WARMUP PRESETS ─────────────────────────────────────────────────────────
 // Load saved presets; fall back to defaults so editors always have content
 $default_warmup = [
@@ -88,6 +104,17 @@ $warmup_presets_php = [
 
 $page_title   = 'Profile';
 $page_context = 'profile';
+$extra_head   = '<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>';
+$extra_styles = '<style>
+@keyframes hrMeasBeat {
+    0%   { transform: scale(1); }
+    14%  { transform: scale(1.3); }
+    28%  { transform: scale(1); }
+    42%  { transform: scale(1.15); }
+    70%  { transform: scale(1); }
+    100% { transform: scale(1); }
+}
+</style>';
 include __DIR__ . '/../core/page_head.php';
 ?>
 
@@ -201,17 +228,46 @@ window.forgeWarmupPresets = {
                     <div class="col-6">
                         <label class="stat-label d-block mb-1" style="font-size:0.6rem;">RESTING HR</label>
                         <div class="d-flex align-items-center gap-2">
-                            <input type="number" class="form-control" inputmode="numeric"
+                            <input type="number" class="form-control" id="restingHrInput" inputmode="numeric"
                                    min="30" max="120" value="<?= htmlspecialchars($profile['resting_hr']) ?>"
                                    placeholder="e.g. 58"
                                    onchange="saveSetting('profile_resting_hr', this.value)">
                             <span class="text-muted" style="font-size:0.75rem;flex-shrink:0;">bpm</span>
                         </div>
+                        <?php if (isset($_SERVER['HTTPS']) || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https')): ?>
+                        <button class="btn btn-sm mt-2 w-100" id="hrMeasureBtn"
+                                style="background:#1a1a1a;border:1px solid #333;color:#888;font-size:0.7rem;font-weight:700;letter-spacing:0.05em;min-height:36px;"
+                                onclick="toggleHrMeasure()">
+                            <i class="bi bi-bluetooth me-1"></i>MEASURE
+                        </button>
+                        <?php endif; ?>
+                    </div>
+
+                    <!-- Inline HR measurement panel (spans full width, hidden by default) -->
+                    <div class="col-12 d-none" id="hrMeasurePanel">
+                        <div style="background:#111;border:1px solid #2a2a2a;border-radius:10px;padding:0.85rem 1rem;">
+                            <!-- Status + live BPM -->
+                            <div class="d-flex align-items-center justify-content-between mb-2">
+                                <div id="hrMeasStatus" style="font-size:0.7rem;font-weight:700;color:#555;text-transform:uppercase;letter-spacing:0.05em;">
+                                    NOT CONNECTED
+                                </div>
+                                <div class="d-flex align-items-center gap-2">
+                                    <i class="bi bi-heart-fill" id="hrMeasHeart" style="color:#FF5722;font-size:1.1rem;opacity:0.2;transition:opacity 0.3s;"></i>
+                                    <span id="hrMeasBpm" style="font-size:1.6rem;font-weight:900;color:#FF5722;font-variant-numeric:tabular-nums;min-width:3ch;text-align:right;">--</span>
+                                    <span style="font-size:0.7rem;color:#555;font-weight:700;">BPM</span>
+                                </div>
+                            </div>
+                            <!-- Progress bar: counts down to average -->
+                            <div style="background:#1a1a1a;border-radius:4px;height:4px;overflow:hidden;margin-bottom:0.6rem;">
+                                <div id="hrMeasProgress" style="height:100%;width:0%;background:#FF5722;transition:width 0.4s;border-radius:4px;"></div>
+                            </div>
+                            <div id="hrMeasHint" style="font-size:0.65rem;color:#444;">Sit still and breathe normally — 30 readings needed</div>
+                        </div>
                     </div>
                     <div class="col-6">
                         <label class="stat-label d-block mb-1" style="font-size:0.6rem;">MAX HR</label>
                         <div class="d-flex align-items-center gap-2">
-                            <input type="number" class="form-control" inputmode="numeric"
+                            <input type="number" class="form-control" id="maxHrInput" inputmode="numeric"
                                    min="100" max="230" value="<?= htmlspecialchars($profile['max_hr']) ?>"
                                    placeholder="<?= $est_max_hr ? "~{$est_max_hr}" : 'e.g. 185' ?>"
                                    onchange="saveSetting('profile_max_hr', this.value)">
@@ -220,6 +276,44 @@ window.forgeWarmupPresets = {
                         <?php if (!$profile['max_hr'] && $est_max_hr): ?>
                         <div class="text-muted mt-1" style="font-size:0.65rem;">Est. from age: <?= $est_max_hr ?> bpm</div>
                         <?php endif; ?>
+                        <?php if (isset($_SERVER['HTTPS']) || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https')): ?>
+                        <button class="btn btn-sm mt-2 w-100" id="maxHrMeasureBtn"
+                                style="background:#1a1a1a;border:1px solid #333;color:#888;font-size:0.7rem;font-weight:700;letter-spacing:0.05em;min-height:36px;"
+                                onclick="toggleMaxHrMeasure()">
+                            <i class="bi bi-bluetooth me-1"></i>MEASURE
+                        </button>
+                        <?php endif; ?>
+                    </div>
+
+                    <!-- Max HR measurement panel (spans full width) -->
+                    <div class="col-12 d-none" id="maxHrMeasurePanel">
+                        <div style="background:#111;border:1px solid #2a2a2a;border-radius:10px;padding:0.85rem 1rem;">
+                            <div class="d-flex align-items-center justify-content-between mb-2">
+                                <div id="maxHrMeasStatus" style="font-size:0.7rem;font-weight:700;color:#555;text-transform:uppercase;letter-spacing:0.05em;">
+                                    NOT CONNECTED
+                                </div>
+                                <div class="d-flex align-items-center gap-3">
+                                    <div class="text-center">
+                                        <div id="maxHrMeasBpm" style="font-size:1.6rem;font-weight:900;color:#FF5722;font-variant-numeric:tabular-nums;min-width:3ch;line-height:1;">--</div>
+                                        <div style="font-size:0.58rem;color:#555;font-weight:700;">LIVE</div>
+                                    </div>
+                                    <div class="text-center">
+                                        <div id="maxHrMeasPeak" style="font-size:1.6rem;font-weight:900;color:#f44336;font-variant-numeric:tabular-nums;min-width:3ch;line-height:1;">--</div>
+                                        <div style="font-size:0.58rem;color:#555;font-weight:700;">PEAK</div>
+                                    </div>
+                                    <div class="text-center">
+                                        <div id="maxHrTimer" style="font-size:1.3rem;font-weight:900;color:#555;font-variant-numeric:tabular-nums;min-width:4ch;line-height:1;">0:00</div>
+                                        <div style="font-size:0.58rem;color:#555;font-weight:700;">TIME</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div id="maxHrMeasHint" style="font-size:0.65rem;color:#444;margin-bottom:0.6rem;">Connect your monitor, then go all-out — sprint, cycle, row hard. Aim for 2 min. Your peak will be saved.</div>
+                            <button id="maxHrStopBtn" class="btn w-100 d-none"
+                                    style="background:#f44336;color:#fff;font-weight:700;font-size:0.75rem;letter-spacing:0.05em;min-height:40px;border:none;border-radius:8px;"
+                                    onclick="stopMaxHrMeasure()">
+                                <i class="bi bi-stop-fill me-1"></i>STOP &amp; SAVE PEAK
+                            </button>
+                        </div>
                     </div>
                 </div>
                 <?php if ($vo2max !== null): ?>
@@ -235,6 +329,48 @@ window.forgeWarmupPresets = {
                 <?php endif; ?>
             </div>
         </div>
+
+        <!-- ── TRENDS ──────────────────────────────────────────────────── -->
+        <?php if (count($bw_history) >= 2 || count($resting_hr_history) >= 2 || count($max_hr_history) >= 2): ?>
+        <div class="stat-label mb-2">TRENDS</div>
+        <div class="card mb-3">
+            <div class="card-body">
+                <?php if (count($bw_history) >= 2): ?>
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between align-items-baseline mb-1">
+                        <div class="stat-label" style="font-size:0.6rem;">BODYWEIGHT</div>
+                        <div style="font-size:0.65rem;color:#555;font-variant-numeric:tabular-nums;">
+                            <?= $bw_history[0]['bodyweight_kg'] ?> → <?= end($bw_history)['bodyweight_kg'] ?> kg
+                        </div>
+                    </div>
+                    <div style="position:relative;height:80px;"><canvas id="bwChart"></canvas></div>
+                </div>
+                <?php endif; ?>
+                <?php if (count($resting_hr_history) >= 2): ?>
+                <div class="<?= count($bw_history) >= 2 ? 'mt-3 pt-3' : '' ?> mb-3" <?= count($bw_history) >= 2 ? 'style="border-top:1px solid #1a1a1a;"' : '' ?>>
+                    <div class="d-flex justify-content-between align-items-baseline mb-1">
+                        <div class="stat-label" style="font-size:0.6rem;">RESTING HR</div>
+                        <div style="font-size:0.65rem;color:#555;font-variant-numeric:tabular-nums;">
+                            <?= $resting_hr_history[0]['bpm'] ?> → <?= end($resting_hr_history)['bpm'] ?> bpm
+                        </div>
+                    </div>
+                    <div style="position:relative;height:80px;"><canvas id="restingHrChart"></canvas></div>
+                </div>
+                <?php endif; ?>
+                <?php if (count($max_hr_history) >= 2): ?>
+                <div class="<?= (count($bw_history) >= 2 || count($resting_hr_history) >= 2) ? 'mt-3 pt-3' : '' ?>" <?= (count($bw_history) >= 2 || count($resting_hr_history) >= 2) ? 'style="border-top:1px solid #1a1a1a;"' : '' ?>>
+                    <div class="d-flex justify-content-between align-items-baseline mb-1">
+                        <div class="stat-label" style="font-size:0.6rem;">MAX HR</div>
+                        <div style="font-size:0.65rem;color:#555;font-variant-numeric:tabular-nums;">
+                            <?= $max_hr_history[0]['bpm'] ?> → <?= end($max_hr_history)['bpm'] ?> bpm
+                        </div>
+                    </div>
+                    <div style="position:relative;height:80px;"><canvas id="maxHrChart"></canvas></div>
+                </div>
+                <?php endif; ?>
+            </div>
+        </div>
+        <?php endif; ?>
 
         <!-- ── LOG MEASUREMENT ──────────────────────────────────────────── -->
         <div class="d-flex align-items-center justify-content-between mb-2">
@@ -697,8 +833,394 @@ async function saveWarmupPresets(cat) {
     }
 });
 
+// ── Max HR measurement via BLE ────────────────────────────────────────────────
+(function () {
+    const HR_SERVICE        = 0x180D;
+    const HR_CHARACTERISTIC = 0x2A37;
+
+    let bleDevice = null;
+    let bleChar   = null;
+    let peakBpm   = 0;
+    let timerInterval = null;
+    let elapsedSec = 0;
+    let panelOpen  = false;
+
+    const panel     = document.getElementById('maxHrMeasurePanel');
+    const btn       = document.getElementById('maxHrMeasureBtn');
+    const statusEl  = document.getElementById('maxHrMeasStatus');
+    const liveBpmEl = document.getElementById('maxHrMeasBpm');
+    const peakEl    = document.getElementById('maxHrMeasPeak');
+    const timerEl   = document.getElementById('maxHrTimer');
+    const hintEl    = document.getElementById('maxHrMeasHint');
+    const stopBtn   = document.getElementById('maxHrStopBtn');
+    const inputEl   = document.getElementById('maxHrInput');
+
+    if (!panel) return;
+
+    function parseHR(value) {
+        const flags = value.getUint8(0);
+        return (flags & 0x01) ? value.getUint16(1, true) : value.getUint8(1);
+    }
+
+    function fmtTime(s) {
+        return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+    }
+
+    function onReading(event) {
+        const bpm = parseHR(event.target.value);
+        if (bpm < 20 || bpm > 250) return;
+        liveBpmEl.textContent = bpm;
+        if (bpm > peakBpm) {
+            peakBpm = bpm;
+            peakEl.textContent = bpm;
+        }
+        // Colour live BPM by zone
+        const pct = bpm / (parseInt(inputEl.max) || 220);
+        const colour = pct > 0.85 ? '#f44336' : pct > 0.70 ? '#FF9800' : '#FF5722';
+        liveBpmEl.style.color = colour;
+    }
+
+    function startTimer() {
+        elapsedSec = 0;
+        timerEl.textContent = fmtTime(0);
+        timerInterval = setInterval(() => {
+            elapsedSec++;
+            timerEl.textContent = fmtTime(elapsedSec);
+            // At 2 min, nudge user (don't auto-stop — they may still be climbing)
+            if (elapsedSec === 120) {
+                hintEl.textContent = '2 min reached — tap STOP & SAVE when ready.';
+            }
+        }, 1000);
+    }
+
+    async function disconnect() {
+        clearInterval(timerInterval);
+        timerInterval = null;
+        if (bleChar) {
+            try { await bleChar.stopNotifications(); } catch (_) {}
+            bleChar.removeEventListener('characteristicvaluechanged', onReading);
+            bleChar = null;
+        }
+        if (bleDevice && bleDevice.gatt.connected) bleDevice.gatt.disconnect();
+        bleDevice = null;
+    }
+
+    window.stopMaxHrMeasure = async function () {
+        await disconnect();
+        if (peakBpm > 0) {
+            inputEl.value = peakBpm;
+            await api('log_hr_measurement', { type: 'max', bpm: peakBpm });
+            statusEl.textContent = 'SAVED — ' + peakBpm + ' BPM PEAK';
+            statusEl.style.color = '#4CAF50';
+            hintEl.textContent   = 'Peak saved to profile. Tap MEASURE again anytime to retest.';
+        }
+        stopBtn.classList.add('d-none');
+        if (btn) { btn.innerHTML = '<i class="bi bi-bluetooth me-1"></i>MEASURE'; btn.style.color = '#888'; }
+    };
+
+    async function startMeasure() {
+        peakBpm    = 0;
+        elapsedSec = 0;
+        liveBpmEl.textContent = '--';
+        peakEl.textContent    = '--';
+        timerEl.textContent   = '0:00';
+        liveBpmEl.style.color = '#FF5722';
+        hintEl.textContent    = 'Connect your monitor, then go all-out — sprint, cycle, row hard. Aim for 2 min. Your peak will be saved.';
+
+        statusEl.textContent = 'SCANNING…';
+        statusEl.style.color = '#FFC107';
+        if (btn) btn.style.color = '#FFC107';
+
+        try {
+            bleDevice = await navigator.bluetooth.requestDevice({
+                filters: [{ services: [HR_SERVICE] }],
+                optionalServices: [HR_SERVICE],
+            });
+            bleDevice.addEventListener('gattserverdisconnected', async () => {
+                clearInterval(timerInterval);
+                statusEl.textContent = 'DISCONNECTED';
+                statusEl.style.color = '#f44336';
+                if (btn) { btn.innerHTML = '<i class="bi bi-bluetooth me-1"></i>MEASURE'; btn.style.color = '#888'; }
+                // Auto-save peak if we got readings
+                if (peakBpm > 0) {
+                    inputEl.value = peakBpm;
+                    await api('log_hr_measurement', { type: 'max', bpm: peakBpm });
+                    statusEl.textContent = 'DISCONNECTED — PEAK ' + peakBpm + ' SAVED';
+                }
+                stopBtn.classList.add('d-none');
+            });
+
+            statusEl.textContent = 'CONNECTING…';
+            const server  = await bleDevice.gatt.connect();
+            const service = await server.getPrimaryService(HR_SERVICE);
+            bleChar        = await service.getCharacteristic(HR_CHARACTERISTIC);
+            await bleChar.startNotifications();
+            bleChar.addEventListener('characteristicvaluechanged', onReading);
+
+            statusEl.textContent = 'GO — PUSH HARD';
+            statusEl.style.color = '#f44336';
+            hintEl.textContent   = 'Give it everything. Aim for at least 2 minutes.';
+            stopBtn.classList.remove('d-none');
+            startTimer();
+            if (btn) btn.innerHTML = '<i class="bi bi-x me-1"></i>CANCEL';
+
+        } catch (err) {
+            clearInterval(timerInterval);
+            if (err.name !== 'NotFoundError' && err.name !== 'AbortError') {
+                statusEl.textContent = 'ERROR';
+                statusEl.style.color = '#f44336';
+                hintEl.textContent   = err.message || 'Could not connect.';
+            } else {
+                statusEl.textContent = 'NOT CONNECTED';
+                statusEl.style.color = '#555';
+            }
+            if (btn) { btn.innerHTML = '<i class="bi bi-bluetooth me-1"></i>MEASURE'; btn.style.color = '#888'; }
+            bleDevice = null;
+        }
+    }
+
+    window.toggleMaxHrMeasure = function () {
+        panelOpen = !panelOpen;
+        panel.classList.toggle('d-none', !panelOpen);
+        if (panelOpen) {
+            if (navigator.bluetooth) {
+                startMeasure();
+            } else {
+                statusEl.textContent = 'WEB BLUETOOTH NOT SUPPORTED';
+                statusEl.style.color = '#f44336';
+                hintEl.textContent   = 'Use Chrome on Android or desktop.';
+            }
+        } else {
+            disconnect();
+            statusEl.textContent = 'NOT CONNECTED';
+            statusEl.style.color = '#555';
+            stopBtn.classList.add('d-none');
+            if (btn) { btn.innerHTML = '<i class="bi bi-bluetooth me-1"></i>MEASURE'; btn.style.color = '#888'; }
+        }
+    };
+})();
+
+// ── Trend charts ──────────────────────────────────────────────────────────────
+try { (function () {
+    const CHART_DEFAULTS = {
+        type: 'line',
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            plugins: { legend: { display: false }, tooltip: {
+                callbacks: { label: ctx => ctx.parsed.y }
+            }},
+            scales: {
+                x: { display: false },
+                y: {
+                    grid: { color: '#1f1f1f' },
+                    ticks: { color: '#444', font: { size: 10, weight: '700' }, maxTicksLimit: 3 },
+                }
+            }
+        }
+    };
+
+    function mkDataset(data, color) {
+        return {
+            data,
+            borderColor: color,
+            borderWidth: 2,
+            pointRadius: data.length <= 10 ? 3 : 0,
+            pointBackgroundColor: color,
+            fill: true,
+            backgroundColor: color + '18',
+            tension: 0.35,
+        };
+    }
+
+    <?php if (count($bw_history) >= 2): ?>
+    new Chart(document.getElementById('bwChart'), {
+        ...CHART_DEFAULTS,
+        data: {
+            labels: <?= json_encode(array_column($bw_history, 'date')) ?>,
+            datasets: [mkDataset(<?= json_encode(array_column($bw_history, 'bodyweight_kg')) ?>, '#FF5722')]
+        },
+        options: { ...CHART_DEFAULTS.options, scales: { ...CHART_DEFAULTS.options.scales,
+            y: { ...CHART_DEFAULTS.options.scales.y,
+                min: Math.min(...<?= json_encode(array_column($bw_history, 'bodyweight_kg')) ?>) - 2,
+                max: Math.max(...<?= json_encode(array_column($bw_history, 'bodyweight_kg')) ?>) + 2,
+            }
+        }}
+    });
+    <?php endif; ?>
+
+    <?php if (count($resting_hr_history) >= 2): ?>
+    new Chart(document.getElementById('restingHrChart'), {
+        ...CHART_DEFAULTS,
+        data: {
+            labels: <?= json_encode(array_column($resting_hr_history, 'date')) ?>,
+            datasets: [mkDataset(<?= json_encode(array_column($resting_hr_history, 'bpm')) ?>, '#42a5f5')]
+        },
+        options: { ...CHART_DEFAULTS.options, scales: { ...CHART_DEFAULTS.options.scales,
+            y: { ...CHART_DEFAULTS.options.scales.y,
+                min: Math.min(...<?= json_encode(array_column($resting_hr_history, 'bpm')) ?>) - 4,
+                max: Math.max(...<?= json_encode(array_column($resting_hr_history, 'bpm')) ?>) + 4,
+            }
+        }}
+    });
+    <?php endif; ?>
+
+    <?php if (count($max_hr_history) >= 2): ?>
+    new Chart(document.getElementById('maxHrChart'), {
+        ...CHART_DEFAULTS,
+        data: {
+            labels: <?= json_encode(array_column($max_hr_history, 'date')) ?>,
+            datasets: [mkDataset(<?= json_encode(array_column($max_hr_history, 'bpm')) ?>, '#f44336')]
+        },
+        options: { ...CHART_DEFAULTS.options, scales: { ...CHART_DEFAULTS.options.scales,
+            y: { ...CHART_DEFAULTS.options.scales.y,
+                min: Math.min(...<?= json_encode(array_column($max_hr_history, 'bpm')) ?>) - 5,
+                max: Math.max(...<?= json_encode(array_column($max_hr_history, 'bpm')) ?>) + 5,
+            }
+        }}
+    });
+    <?php endif; ?>
+})(); } catch (e) { console.warn('FORGE: chart render failed', e); }
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 refreshRestAlertUI();
+
+// ── Resting HR measurement via BLE ───────────────────────────────────────────
+(function () {
+    const HR_SERVICE        = 0x180D;
+    const HR_CHARACTERISTIC = 0x2A37;
+    const SAMPLE_TARGET     = 30;
+
+    let bleDevice = null;
+    let bleChar   = null;
+    let samples   = [];
+    let panelOpen = false;
+
+    const panel      = document.getElementById('hrMeasurePanel');
+    const btn        = document.getElementById('hrMeasureBtn');
+    const statusEl   = document.getElementById('hrMeasStatus');
+    const bpmEl      = document.getElementById('hrMeasBpm');
+    const heartEl    = document.getElementById('hrMeasHeart');
+    const progressEl = document.getElementById('hrMeasProgress');
+    const hintEl     = document.getElementById('hrMeasHint');
+    const inputEl    = document.getElementById('restingHrInput');
+
+    function parseHR(value) {
+        const flags = value.getUint8(0);
+        return (flags & 0x01) ? value.getUint16(1, true) : value.getUint8(1);
+    }
+
+    function setStatus(text, color) {
+        statusEl.textContent = text;
+        statusEl.style.color = color || '#555';
+    }
+
+    async function onReading(event) {
+        const bpm = parseHR(event.target.value);
+        if (bpm < 20 || bpm > 200) return;
+
+        bpmEl.textContent = bpm;
+        heartEl.style.opacity = '1';
+        heartEl.style.animation = 'hrMeasBeat ' + (60000 / bpm).toFixed(0) + 'ms ease-in-out infinite';
+
+        samples.push(bpm);
+        const pct = Math.min(100, (samples.length / SAMPLE_TARGET) * 100);
+        progressEl.style.width = pct + '%';
+
+        if (samples.length < SAMPLE_TARGET) {
+            const remaining = SAMPLE_TARGET - samples.length;
+            hintEl.textContent = 'Sit still… ' + remaining + ' more reading' + (remaining === 1 ? '' : 's');
+        } else {
+            // Enough samples — compute average, save setting + historical record
+            const avg = Math.round(samples.reduce((a, b) => a + b, 0) / samples.length);
+            inputEl.value = avg;
+            await api('log_hr_measurement', { type: 'resting', bpm: avg });
+            setStatus('SAVED — ' + avg + ' BPM', '#4CAF50');
+            hintEl.textContent = 'Average of ' + samples.length + ' readings saved to your profile.';
+            progressEl.style.background = '#4CAF50';
+            stopMeasure();
+        }
+    }
+
+    async function stopMeasure() {
+        if (bleChar) {
+            try { await bleChar.stopNotifications(); } catch (_) {}
+            bleChar.removeEventListener('characteristicvaluechanged', onReading);
+            bleChar = null;
+        }
+        if (bleDevice && bleDevice.gatt.connected) bleDevice.gatt.disconnect();
+        bleDevice = null;
+        if (btn) {
+            btn.innerHTML = '<i class="bi bi-bluetooth me-1"></i>MEASURE';
+            btn.style.color = '#888';
+        }
+    }
+
+    async function startMeasure() {
+        samples = [];
+        progressEl.style.width = '0%';
+        progressEl.style.background = '#FF5722';
+        bpmEl.textContent = '--';
+        heartEl.style.opacity = '0.2';
+        heartEl.style.animation = '';
+        hintEl.textContent = 'Sit still and breathe normally — ' + SAMPLE_TARGET + ' readings needed';
+
+        setStatus('SCANNING…', '#FFC107');
+        if (btn) btn.style.color = '#FFC107';
+
+        try {
+            bleDevice = await navigator.bluetooth.requestDevice({
+                filters: [{ services: [HR_SERVICE] }],
+                optionalServices: [HR_SERVICE],
+            });
+            bleDevice.addEventListener('gattserverdisconnected', () => {
+                setStatus('DISCONNECTED', '#f44336');
+                if (btn) { btn.innerHTML = '<i class="bi bi-bluetooth me-1"></i>MEASURE'; btn.style.color = '#888'; }
+                heartEl.style.opacity = '0.2';
+                heartEl.style.animation = '';
+            });
+
+            setStatus('CONNECTING…', '#FFC107');
+            const server  = await bleDevice.gatt.connect();
+            const service = await server.getPrimaryService(HR_SERVICE);
+            bleChar        = await service.getCharacteristic(HR_CHARACTERISTIC);
+            await bleChar.startNotifications();
+            bleChar.addEventListener('characteristicvaluechanged', onReading);
+            setStatus('READING…', '#4CAF50');
+            if (btn) btn.innerHTML = '<i class="bi bi-x me-1"></i>CANCEL';
+
+        } catch (err) {
+            if (err.name !== 'NotFoundError' && err.name !== 'AbortError') {
+                setStatus('ERROR', '#f44336');
+                hintEl.textContent = err.message || 'Could not connect to HR monitor.';
+            } else {
+                setStatus('NOT CONNECTED', '');
+            }
+            if (btn) { btn.innerHTML = '<i class="bi bi-bluetooth me-1"></i>MEASURE'; btn.style.color = '#888'; }
+            bleDevice = null;
+        }
+    }
+
+    window.toggleHrMeasure = function () {
+        if (!panel) return;
+        panelOpen = !panelOpen;
+        panel.classList.toggle('d-none', !panelOpen);
+        if (panelOpen) {
+            // Only auto-start if BT is available
+            if (navigator.bluetooth) {
+                startMeasure();
+            } else {
+                setStatus('WEB BLUETOOTH NOT SUPPORTED', '#f44336');
+                hintEl.textContent = 'Use Chrome on Android or desktop.';
+            }
+        } else {
+            stopMeasure();
+            setStatus('NOT CONNECTED', '');
+            bpmEl.textContent = '--';
+        }
+    };
+})();
 </script>
 
 </body>

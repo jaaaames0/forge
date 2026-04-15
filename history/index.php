@@ -153,6 +153,47 @@ if ($exercise_id) {
         $exercises[$eid]['sets'][] = $s;
     }
 
+    // HR timeline data
+    $hr_stmt = $db->prepare("SELECT sampled_at, bpm FROM workout_hr_samples WHERE workout_id = ? ORDER BY sampled_at ASC");
+    $hr_stmt->execute([$workout_id]);
+    $hr_samples_raw = $hr_stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Set completion events (working sets with logged_at)
+    $se_stmt = $db->prepare("
+        SELECT ws.logged_at, ws.set_number, ws.set_type, ws.hr_max, e.name as exercise_name
+        FROM workout_sets ws
+        JOIN exercises e ON e.id = ws.exercise_id
+        WHERE ws.workout_id = ? AND ws.logged_at IS NOT NULL AND ws.set_type = 'working'
+        ORDER BY ws.logged_at ASC
+    ");
+    $se_stmt->execute([$workout_id]);
+    $set_events_raw = $se_stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Convert timestamps to seconds-since-workout-start.
+    // workout.started_at and logged_at are PHP-generated (Australia/Sydney local time).
+    // workout_hr_samples.sampled_at is JS-generated via toISOString() — stored as UTC without 'Z'.
+    // Appending ' UTC' to sampled_at forces correct UTC parsing regardless of server timezone.
+    $workout_start_ts = strtotime($workout['started_at']);
+    $hr_samples_js = array_map(fn($s) => [
+        'x' => strtotime($s['sampled_at'] . ' UTC') - $workout_start_ts,
+        'y' => (int)$s['bpm'],
+    ], $hr_samples_raw);
+    $set_events_js = array_map(fn($s) => [
+        'x'    => strtotime($s['logged_at']) - $workout_start_ts,
+        'name' => $s['exercise_name'],
+        'set'  => (int)$s['set_number'],
+        'hrMax' => $s['hr_max'] ? (int)$s['hr_max'] : null,
+    ], $set_events_raw);
+
+    $has_hr = count($hr_samples_raw) >= 2;
+
+    // HR summary stats
+    if ($has_hr) {
+        $bpms = array_column($hr_samples_raw, 'bpm');
+        $hr_min = min($bpms); $hr_max_val = max($bpms);
+        $hr_avg_val = (int)round(array_sum($bpms) / count($bpms));
+    }
+
     $total_volume = 0; $working_sets = 0;
     foreach ($exercises as $ex) {
         foreach ($ex['sets'] as $s) {
@@ -162,8 +203,36 @@ if ($exercise_id) {
         }
     }
 
+    // Profile HR for %HRR and HRRec computation in set tables
+    $profile_resting_hr = (int)get_user_setting($db, 'profile_resting_hr', '0');
+    $profile_max_hr     = (int)get_user_setting($db, 'profile_max_hr',     '0');
+    $can_compute_hrr    = $profile_resting_hr > 0 && $profile_max_hr > $profile_resting_hr;
+
+    // Build HR sample time-index for HRRec lookups: ts (unix, UTC) => bpm
+    // sampled_at stored as UTC (JS toISOString), logged_at stored as AEST (PHP)
+    $hr_ts_map = [];
+    foreach ($hr_samples_raw as $sp) {
+        $hr_ts_map[strtotime($sp['sampled_at'] . ' UTC')] = (int)$sp['bpm'];
+    }
+    ksort($hr_ts_map);
+    $hr_ts_keys = array_keys($hr_ts_map);
+
+    // Find bpm closest to target unix timestamp, within $tolerance seconds. Returns null if no match.
+    function nearest_hr_bpm(int $target_ts, array $ts_map, array $ts_keys, int $tolerance = 20): ?int {
+        if (empty($ts_keys)) return null;
+        $lo = 0; $hi = count($ts_keys) - 1;
+        while ($lo < $hi) { $mid = ($lo + $hi) >> 1; if ($ts_keys[$mid] < $target_ts) $lo = $mid + 1; else $hi = $mid; }
+        // $lo is now the first key >= target; check lo and lo-1
+        $best_ts = $ts_keys[$lo];
+        if ($lo > 0 && abs($ts_keys[$lo - 1] - $target_ts) < abs($best_ts - $target_ts)) {
+            $best_ts = $ts_keys[$lo - 1];
+        }
+        return abs($best_ts - $target_ts) <= $tolerance ? $ts_map[$best_ts] : null;
+    }
+
     $page_title   = $workout['name'] ?: date('j M Y', strtotime($workout['started_at']));
     $page_context = 'history';
+    $extra_head   = '<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>';
     include __DIR__ . '/../core/page_head.php';
 ?>
 
@@ -189,11 +258,30 @@ if ($exercise_id) {
         </button>
     </div>
 
+    <?php
+    // For cardio sessions, pull distance + elevation from the single set row
+    $cardio_distance = null; $cardio_elevation = null; $cardio_intensity = null;
+    if (($workout['type'] ?? 'strength') === 'cardio') {
+        foreach ($exercises as $ex) {
+            foreach ($ex['sets'] as $s) {
+                if ($s['distance_km'])  $cardio_distance  = (float)$s['distance_km'];
+                if ($s['elevation_m'])  $cardio_elevation = (float)$s['elevation_m'];
+                if ($s['intensity'])    $cardio_intensity = (int)$s['intensity'];
+            }
+        }
+    }
+    ?>
     <div class="row g-2 mb-3">
         <div class="col-3 text-center"><div class="stat-label">TIME</div><div class="stat-value" style="font-size:1.1rem;"><?= fmtDur($workout['started_at'], $workout['finished_at']) ?></div></div>
+        <?php if (($workout['type'] ?? 'strength') === 'cardio'): ?>
+        <div class="col-3 text-center"><div class="stat-label">DIST</div><div class="stat-value" style="font-size:1.1rem;"><?= $cardio_distance ? $cardio_distance . ' km' : '—' ?></div></div>
+        <div class="col-3 text-center"><div class="stat-label">ELEV</div><div class="stat-value" style="font-size:1.1rem;"><?= $cardio_elevation ? round($cardio_elevation) . 'm' : '—' ?></div></div>
+        <div class="col-3 text-center"><div class="stat-label">INT</div><div class="stat-value" style="font-size:1.1rem;"><?= $cardio_intensity ?? '—' ?></div></div>
+        <?php else: ?>
         <div class="col-3 text-center"><div class="stat-label">EXERCISES</div><div class="stat-value" style="font-size:1.1rem;"><?= count($exercises) ?></div></div>
         <div class="col-3 text-center"><div class="stat-label">SETS</div><div class="stat-value" style="font-size:1.1rem;"><?= $working_sets ?></div></div>
         <div class="col-3 text-center"><div class="stat-label">VOLUME</div><div class="stat-value" style="font-size:0.95rem;"><?= $total_volume > 0 ? fmtVol($total_volume, $unit) : '—' ?></div></div>
+        <?php endif; ?>
     </div>
 
     <?php if ($workout['notes']): ?>
@@ -201,6 +289,25 @@ if ($exercise_id) {
         <div class="card-body py-2 px-3">
             <div class="stat-label mb-1">NOTES</div>
             <div style="font-size:0.9rem;"><?= nl2br(htmlspecialchars($workout['notes'])) ?></div>
+        </div>
+    </div>
+    <?php endif; ?>
+
+    <?php if ($has_hr): ?>
+    <div class="card mb-3">
+        <div class="card-body py-2 px-3">
+            <div class="d-flex align-items-center justify-content-between mb-2">
+                <div class="stat-label"><i class="bi bi-heart-pulse me-1"></i>HEART RATE</div>
+                <div style="font-family:monospace; font-size:0.72rem; color:#888;">
+                    <span style="color:#555;">min</span> <span style="color:#e0e0e0; font-weight:700;"><?= $hr_min ?></span>
+                    &nbsp;<span style="color:#555;">avg</span> <span style="color:#e0e0e0; font-weight:700;"><?= $hr_avg_val ?></span>
+                    &nbsp;<span style="color:#555;">max</span> <span style="color:#ef5350; font-weight:700;"><?= $hr_max_val ?></span>
+                    &nbsp;<span style="color:#555;">bpm</span>
+                </div>
+            </div>
+            <div style="position:relative; height:110px;">
+                <canvas id="hr-timeline-chart"></canvas>
+            </div>
         </div>
     </div>
     <?php endif; ?>
@@ -219,35 +326,75 @@ if ($exercise_id) {
             <div class="table-responsive">
             <table class="set-table" style="table-layout:fixed; width:100%;">
                 <?php if ($is_cardio): ?>
-                <colgroup><col style="width:28px;"><col style="width:70px;"><col><col><col><col style="width:44px;"><col style="width:44px;"></colgroup>
-                <thead><tr><th>#</th><th>TYPE</th><th>TIME</th><th>KM</th><th>AVG SPEED</th><th>AVG HR</th><th>MAX HR</th></tr></thead>
+                <colgroup><col style="width:28px;"><col><col><col><col style="width:52px;"><col style="width:44px;"><col style="width:44px;"></colgroup>
+                <thead><tr><th>#</th><th>TIME</th><th>KM</th><th>ELEV</th><th>AVG SPEED</th><th>AVG HR</th><th>MAX HR</th></tr></thead>
                 <tbody>
                 <?php foreach ($ex['sets'] as $i => $s):
                     $set_speed = ($s['distance_km'] && $s['duration_sec'])
-                        ? round($s['distance_km'] / ($s['duration_sec'] / 3600.0), 2) . ' km/h'
+                        ? round($s['distance_km'] / ($s['duration_sec'] / 3600.0), 2) . 'k/h'
+                        : '—';
+                    $dur_fmt = $s['duration_sec']
+                        ? (floor($s['duration_sec'] / 3600) > 0
+                            ? floor($s['duration_sec'] / 3600) . 'h ' . gmdate('i:s', (int)$s['duration_sec'] % 3600)
+                            : gmdate('i:s', (int)$s['duration_sec']))
                         : '—';
                 ?>
                 <tr>
                     <td style="font-weight:900; color:#888; font-size:0.9rem;"><?= $i + 1 ?></td>
-                    <td><span class="set-type-badge badge-<?= $s['set_type'] ?>"><?= $s['set_type'] ?></span></td>
-                    <td style="font-weight:700;"><?= $s['duration_sec'] ? gmdate('i:s', (int)$s['duration_sec']) : '—' ?></td>
-                    <td style="font-weight:700;"><?= $s['distance_km'] ?? '—' ?></td>
+                    <td style="font-weight:700;"><?= $dur_fmt ?></td>
+                    <td style="font-weight:700;"><?= $s['distance_km'] ? $s['distance_km'] . ' km' : '—' ?></td>
+                    <td style="color:#888;"><?= $s['elevation_m'] ? $s['elevation_m'] . 'm' : '—' ?></td>
                     <td style="font-weight:700;"><?= $set_speed ?></td>
                     <td style="color:#888;"><?= $s['hr_avg'] ?? '—' ?></td>
                     <td style="color:#888;"><?= $s['hr_max'] ?? '—' ?></td>
                 </tr>
                 <?php endforeach; ?>
+                <?php else:
+                    // Determine if any set in this exercise has HR data — show %HRR column if so
+                    $ex_has_hr = $can_compute_hrr && array_reduce($ex['sets'], fn($carry, $s) => $carry || !empty($s['hr_max']), false);
+                ?>
+                <?php if ($ex_has_hr): ?>
+                <colgroup><col style="width:28px;"><col style="width:64px;"><col><col><col style="width:44px;"><col style="width:48px;"></colgroup>
+                <thead><tr><th>#</th><th>TYPE</th><th><?= strtoupper($unit) ?></th><th>REPS</th><th>RPE</th><th><i class="bi bi-heart-pulse" title="%HRR / HRRec"></i></th></tr></thead>
                 <?php else: ?>
                 <colgroup><col style="width:28px;"><col style="width:70px;"><col><col><col style="width:52px;"></colgroup>
                 <thead><tr><th>#</th><th>TYPE</th><th><?= strtoupper($unit) ?></th><th>REPS</th><th>RPE</th></tr></thead>
+                <?php endif; ?>
                 <tbody>
-                <?php foreach ($ex['sets'] as $i => $s): ?>
+                <?php foreach ($ex['sets'] as $i => $s):
+                    // Compute %HRR for this set
+                    $hrr_pct = null;
+                    if ($can_compute_hrr && !empty($s['hr_max'])) {
+                        $pct = ($s['hr_max'] - $profile_resting_hr) / ($profile_max_hr - $profile_resting_hr) * 100;
+                        if ($pct >= 0 && $pct <= 200) $hrr_pct = (int)round($pct);
+                    }
+                    // Compute HRRec for this set (bpm drop at 60s post-set)
+                    $hrrec = null;
+                    if (!empty($s['hr_max']) && !empty($s['logged_at']) && !empty($hr_ts_keys)) {
+                        $target_ts   = strtotime($s['logged_at']) + 60;
+                        $recovery_bpm = nearest_hr_bpm($target_ts, $hr_ts_map, $hr_ts_keys);
+                        if ($recovery_bpm !== null) {
+                            $drop = (int)$s['hr_max'] - $recovery_bpm;
+                            if ($drop > 0) $hrrec = $drop;
+                        }
+                    }
+                ?>
                 <tr class="<?= $s['set_type'] === 'warmup' ? 'set-warmup' : '' ?>">
                     <td style="font-weight:900; color:#888; font-size:0.9rem;"><?= $i + 1 ?></td>
                     <td><span class="set-type-badge badge-<?= $s['set_type'] ?>"><?= $s['set_type'] ?></span></td>
                     <td style="font-weight:700;"><?= $s['weight_kg'] ?? '—' ?></td>
                     <td style="font-weight:700;"><?= $s['reps'] ?? '—' ?></td>
                     <td style="color:#888;"><?= $s['rpe'] ?? '—' ?></td>
+                    <?php if ($ex_has_hr): ?>
+                    <td style="color:#ef5350; font-size:0.75rem; line-height:1.3;">
+                        <?php if ($hrr_pct !== null): ?>
+                            <span style="font-weight:700;"><?= $hrr_pct ?>%</span>
+                            <?php if ($hrrec !== null): ?>
+                            <br><span style="color:#ab47bc; font-size:0.65rem;">↓<?= $hrrec ?></span>
+                            <?php endif; ?>
+                        <?php else: ?>—<?php endif; ?>
+                    </td>
+                    <?php endif; ?>
                 </tr>
                 <?php endforeach; ?>
                 <?php endif; ?>
@@ -274,6 +421,130 @@ async function deleteWorkout(id) {
     if (r.status === 'success') window.location.href = '/forge/history/';
     else alert('Error: ' + r.message);
 }
+
+<?php if ($has_hr): ?>
+(function () {
+    const hrData      = <?= json_encode(array_values($hr_samples_js)) ?>;
+    const setEvents   = <?= json_encode(array_values($set_events_js)) ?>;
+
+    // Find nearest HR value to a given x (seconds), within maxGap seconds
+    function nearestHR(sec, maxGap = 30) {
+        let best = null, bestDiff = Infinity;
+        for (const p of hrData) {
+            const d = Math.abs(p.x - sec);
+            if (d < bestDiff) { bestDiff = d; best = p.y; }
+        }
+        return bestDiff <= maxGap ? best : null;
+    }
+
+    // Build scatter markers for set events that have an HR reading nearby
+    const setMarkers = setEvents.map(ev => {
+        const y = ev.hrMax ?? nearestHR(ev.x);
+        if (!y) return null;
+        return { x: ev.x, y, name: ev.name, set: ev.set };
+    }).filter(Boolean);
+
+    // Custom plugin: draw orange vertical dashed lines at set completion times
+    const setLinePlugin = {
+        id: 'setLines',
+        afterDraw(chart) {
+            const { ctx, scales: { x: xScale, y: yScale } } = chart;
+            ctx.save();
+            ctx.strokeStyle = 'rgba(255,87,34,0.25)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([3, 4]);
+            for (const m of setMarkers) {
+                const px = xScale.getPixelForValue(m.x);
+                ctx.beginPath();
+                ctx.moveTo(px, yScale.top);
+                ctx.lineTo(px, yScale.bottom);
+                ctx.stroke();
+            }
+            ctx.restore();
+        }
+    };
+
+    // x-axis tick formatter: show "Nm" at minute boundaries
+    function fmtSec(v) {
+        if (v % 60 !== 0) return '';
+        const m = Math.round(v / 60);
+        return m === 0 ? '0' : m + 'm';
+    }
+
+    Chart.defaults.color = '#888';
+    Chart.defaults.borderColor = '#333';
+
+    new Chart(document.getElementById('hr-timeline-chart'), {
+        type: 'line',
+        data: {
+            datasets: [
+                {
+                    data: hrData,
+                    borderColor: '#ef5350',
+                    backgroundColor: 'rgba(239,83,80,0.08)',
+                    fill: true,
+                    pointRadius: 0,
+                    borderWidth: 1.5,
+                    tension: 0.3,
+                    label: 'HR',
+                    order: 2,
+                },
+                {
+                    type: 'scatter',
+                    data: setMarkers,
+                    backgroundColor: '#FF5722',
+                    pointRadius: 4,
+                    pointStyle: 'triangle',
+                    pointHoverRadius: 6,
+                    label: 'Set',
+                    order: 1,
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            scales: {
+                x: {
+                    type: 'linear',
+                    grid: { color: '#1e1e1e' },
+                    ticks: {
+                        color: '#555',
+                        font: { size: 9 },
+                        maxTicksLimit: 10,
+                        callback: fmtSec,
+                    }
+                },
+                y: {
+                    grid: { color: '#1e1e1e' },
+                    ticks: { color: '#555', font: { size: 9 }, maxTicksLimit: 5 },
+                }
+            },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        title(items) {
+                            const v = items[0].parsed.x;
+                            const m = Math.floor(v / 60);
+                            const s = String(Math.round(v % 60)).padStart(2, '0');
+                            return m + ':' + s;
+                        },
+                        label(item) {
+                            if (item.datasetIndex === 1) {
+                                return item.raw.name + ' set ' + item.raw.set + ' — ' + item.raw.y + ' bpm';
+                            }
+                            return item.parsed.y + ' bpm';
+                        }
+                    }
+                }
+            }
+        },
+        plugins: [setLinePlugin]
+    });
+})();
+<?php endif; ?>
 </script>
 
 <?php
@@ -294,7 +565,9 @@ async function deleteWorkout(id) {
                COUNT(DISTINCT ws.exercise_id) as exercise_count,
                COUNT(CASE WHEN ws.set_type='working' THEN 1 END) as working_set_count,
                SUM(CASE WHEN ws.set_type='working' AND ws.weight_kg IS NOT NULL AND ws.reps IS NOT NULL
-                        THEN ws.weight_kg * ws.reps ELSE 0 END) as total_volume_kg
+                        THEN ws.weight_kg * ws.reps ELSE 0 END) as total_volume_kg,
+               SUM(ws.distance_km)  as total_distance_km,
+               SUM(ws.elevation_m)  as total_elevation_m
         FROM workouts w
         LEFT JOIN workout_sets ws ON ws.workout_id = w.id
         WHERE w.finished_at IS NOT NULL
@@ -374,6 +647,18 @@ async function deleteWorkout(id) {
                         </div>
                         <i class="bi bi-chevron-right text-muted" style="flex-shrink:0; margin-top:2px;"></i>
                     </div>
+                    <?php if (($w['type'] ?? 'strength') === 'cardio'): ?>
+                    <div class="d-flex gap-3 mt-2">
+                        <div><span class="stat-label"><i class="bi bi-activity" style="color:#FF5722;"></i></span>
+                            <span style="font-weight:900; font-size:0.8rem; color:#FF5722; letter-spacing:0.3px;">CARDIO</span></div>
+                        <?php if ($w['total_distance_km']): ?>
+                        <div><span class="stat-label">DIST</span> <span style="font-weight:900; font-size:0.9rem;"><?= round((float)$w['total_distance_km'], 2) ?> km</span></div>
+                        <?php endif; ?>
+                        <?php if ($w['total_elevation_m']): ?>
+                        <div><span class="stat-label">ELEV</span> <span style="font-weight:900; font-size:0.9rem;"><?= round((float)$w['total_elevation_m']) ?>m</span></div>
+                        <?php endif; ?>
+                    </div>
+                    <?php else: ?>
                     <div class="d-flex gap-3 mt-2">
                         <div><span class="stat-label">EX</span> <span style="font-weight:900; font-size:0.9rem;"><?= $w['exercise_count'] ?></span></div>
                         <div><span class="stat-label">SETS</span> <span style="font-weight:900; font-size:0.9rem;"><?= $w['working_set_count'] ?></span></div>
@@ -381,6 +666,7 @@ async function deleteWorkout(id) {
                         <div><span class="stat-label">VOL</span> <span style="font-weight:900; font-size:0.9rem; color:#FF5722;"><?= fmtVol((float)$w['total_volume_kg'], $unit) ?></span></div>
                         <?php endif; ?>
                     </div>
+                    <?php endif; ?>
                 </div>
             </div>
         </a>

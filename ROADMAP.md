@@ -2,31 +2,9 @@
 
 Ideas and future directions for FORGE. Not prioritised — just things worth building when the time is right.
 
-## Heart rate monitoring (Web Bluetooth)
+## Cardio — distance splits
 
-The COOSPO H808S (and most modern BLE chest straps) expose a standard Heart Rate service that Android Chrome can connect to via the Web Bluetooth API. `workout_sets.hr_avg` and `hr_max` already exist in the schema — no migration needed for basic per-set logging.
-
-**Core implementation:**
-- "Connect HR monitor" button in the Settings tab and/or active workout bar
-- `navigator.bluetooth.requestDevice({ filters: [{ services: ['heart_rate'] }] })` → browser picker
-- Subscribe to `heart_rate_measurement` characteristic (UUID `0x2A37`); parse flags byte (bit 0) to determine 8-bit vs 16-bit HR value
-- Display live BPM as a badge in the active workout bar while a workout is open
-- On set tick: compute avg/max from the HR stream captured since the previous tick and write to `workout_sets.hr_avg` / `hr_max`
-
-**Cross-page persistence:**
-Web Bluetooth connections are tied to a JS page context — a full navigation drops the connection. Mitigation: store the paired device name in `localStorage`; on every page load during an active workout, auto-reconnect to the stored device name without showing a picker (Chrome reconnects to a known device in under a second). Show a persistent `♥ BPM` indicator in the header reflecting connected / reconnecting state.
-
-**Cardio mode:**
-When a cardio exercise set is started with an HR monitor connected, replace the current "fill in duration then save" flow with a stopwatch UI:
-- Big **START** button records an absolute start timestamp on the set row (requires adding `started_at DATETIME` to `workout_sets`)
-- Live elapsed time + live BPM displayed while running
-- **STOP** button computes duration from start/end, aggregates avg/max HR from the stream
-- Distance, incline, and intensity still entered manually (during or after the interval)
-
-**TWA packaging (stretch goal):**
-Google's `bubblewrap` CLI can wrap FORGE into a sideloadable Android APK via Trusted Web Activity. Requires a `manifest.json` and valid service worker (already have the SW; manifest is a small addition). The result looks and behaves like a native app. The BLE lifecycle is unchanged (still Chrome WebView underneath), but the auto-reconnect pattern above makes this seamless in practice.
-
-**iOS:** Web Bluetooth is not supported on iOS Safari. Not a priority.
+Currently cardio sessions capture a single distance figure at the end. A SPLIT button mid-session could mark lap/km splits, storing each as its own `workout_set` row with distance + elapsed time. This would enable per-km pace charting, negative/positive split detection, and average pace chips. Needs schema design (multi-row vs single-row per session) and UX thought for mid-run tapping.
 
 ## Multi-user
 
@@ -105,3 +83,4 @@ SPENCE (`/srv/jaaaames.com/spence/`) handles diet and nutrition. Natural integra
 - **Export** — CSV or JSON export of all workout history.
 - **PR highlights in workout history** — surface the `is_pr` flag already stored on `workout_sets` in the history detail view so past PRs are visible when reviewing old sessions.
 - **Feet/inches on profile** — unit toggle (cm | ft + in) on the USER tab. Store height as cm in the DB; convert on input/display in JS. Persist preference in `localStorage` or user profile settings.
+- **TWA packaging (stretch goal)** — `bubblewrap` wraps FORGE into a sideloadable Android APK via Trusted Web Activity. BLE and Web Bluetooth work unchanged under Chrome WebView. iOS: Web Bluetooth not supported in Safari, not a priority.

@@ -245,6 +245,23 @@ if ($exercise_id) {
         <div class="chart-container" style="height:140px; padding:12px;"><canvas id="chart-vol"></canvas></div>
     </div>
 
+    <div id="hrr-section" style="display:none;">
+        <div class="mb-4">
+            <div class="d-flex align-items-center justify-content-between mb-2">
+                <div class="stat-label"><i class="bi bi-heart-pulse me-1"></i>%HRR OVER TIME</div>
+                <div id="hrr-range" style="font-family:monospace; font-size:0.7rem; color:#888;"></div>
+            </div>
+            <div class="chart-container" style="height:140px; padding:12px;"><canvas id="chart-hrr"></canvas></div>
+        </div>
+        <div id="hrrec-section" style="display:none;" class="mb-4">
+            <div class="d-flex align-items-center justify-content-between mb-2">
+                <div class="stat-label"><i class="bi bi-activity me-1"></i>HR RECOVERY <span class="text-muted" style="font-size:0.62rem; font-weight:400;">(bpm drop at 60s, higher = fitter)</span></div>
+                <div id="hrrec-range" style="font-family:monospace; font-size:0.7rem; color:#888;"></div>
+            </div>
+            <div class="chart-container" style="height:140px; padding:12px;"><canvas id="chart-hrrec"></canvas></div>
+        </div>
+    </div>
+
     <?php endif; ?>
 
 </div>
@@ -440,6 +457,43 @@ async function loadCharts() {
                 [{ data: d.volume_history.map(r => parseFloat(r.volume_kg) || 0),
                    backgroundColor: DIM, borderColor: ACCENT, borderWidth: 1, borderRadius: 3 }],
                 v => v >= 1000 ? (v/1000).toFixed(0)+'k' : v);
+        }
+
+        // %HRR + HRRec charts
+        const hrrFd = new FormData();
+        hrrFd.append('action', 'get_exercise_hrr');
+        hrrFd.append('exercise_id', EX_ID);
+        const hrrRes = await fetch('/forge/core/progress_api.php', { method: 'POST', body: hrrFd }).then(r => r.json());
+        if (hrrRes.status === 'success' && hrrRes.data.length >= 2) {
+            const hrrData = hrrRes.data;
+            document.getElementById('hrr-section').style.display = '';
+
+            const hrrVals = hrrData.map(r => parseFloat(r.avg_hrr_pct));
+            const hrrMin  = Math.min(...hrrVals).toFixed(0);
+            const hrrMax  = Math.max(...hrrVals).toFixed(0);
+            document.getElementById('hrr-range').textContent = hrrMin + '% → ' + hrrMax + '%';
+
+            charts.hrr = mkChart('chart-hrr', 'line',
+                hrrData.map(r => r.date),
+                [{ data: hrrVals, borderColor: '#ef5350', backgroundColor: 'rgba(239,83,80,0.1)',
+                   fill: true, tension: 0.3, pointRadius: 3, pointBackgroundColor: '#ef5350', spanGaps: true }],
+                v => v.toFixed(0) + '%');
+
+            // HRRec chart — only when enough sessions have recovery data
+            const hrrec = hrrData.filter(r => r.hrrec !== null);
+            if (hrrec.length >= 2) {
+                document.getElementById('hrrec-section').style.display = '';
+                const rrecVals = hrrec.map(r => parseFloat(r.hrrec));
+                const rrecMin  = Math.min(...rrecVals).toFixed(0);
+                const rrecMax  = Math.max(...rrecVals).toFixed(0);
+                document.getElementById('hrrec-range').textContent = rrecMin + ' → ' + rrecMax + ' bpm';
+
+                charts.hrrec = mkChart('chart-hrrec', 'line',
+                    hrrec.map(r => r.date),
+                    [{ data: rrecVals, borderColor: '#ab47bc', backgroundColor: 'rgba(171,71,188,0.1)',
+                       fill: true, tension: 0.3, pointRadius: 3, pointBackgroundColor: '#ab47bc', spanGaps: true }],
+                    v => v.toFixed(0) + ' bpm');
+            }
         }
     }
 }

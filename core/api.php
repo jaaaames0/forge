@@ -92,6 +92,47 @@ try {
             echo json_encode(['status' => 'success', 'data' => $wo->fetch(PDO::FETCH_ASSOC), 'resumed' => false]);
         }
 
+    } elseif ($action === 'finish_cardio') {
+        // Atomically saves the cardio session set + finishes the workout.
+        // hr_avg and hr_max are auto-computed from workout_hr_samples.
+        $workout_id  = (int)($_POST['workout_id']  ?? 0);
+        $exercise_id = (int)($_POST['exercise_id'] ?? 0);
+        if (!$workout_id || !$exercise_id) throw new Exception('workout_id and exercise_id required');
+
+        $duration  = (isset($_POST['duration_sec'])  && $_POST['duration_sec']  !== '') ? (int)$_POST['duration_sec']   : null;
+        $distance  = (isset($_POST['distance_km'])   && $_POST['distance_km']   !== '') ? (float)$_POST['distance_km']  : null;
+        $elevation = (isset($_POST['elevation_m'])   && $_POST['elevation_m']   !== '') ? (float)$_POST['elevation_m']  : null;
+        $intensity = (isset($_POST['intensity'])     && $_POST['intensity']     !== '') ? (int)$_POST['intensity']      : null;
+        $notes       = $_POST['notes'] ?? null;
+        $bodyweight  = (isset($_POST['bodyweight_kg']) && $_POST['bodyweight_kg'] !== '') ? (float)$_POST['bodyweight_kg'] : null;
+
+        // Auto-compute avg/max HR from samples collected during this session
+        $bpm_stmt = $db->prepare("SELECT bpm FROM workout_hr_samples WHERE workout_id = ?");
+        $bpm_stmt->execute([$workout_id]);
+        $bpms  = array_column($bpm_stmt->fetchAll(PDO::FETCH_ASSOC), 'bpm');
+        $hr_avg = !empty($bpms) ? (int)round(array_sum($bpms) / count($bpms)) : null;
+        $hr_max = !empty($bpms) ? (int)max($bpms) : null;
+
+        $now = date('Y-m-d H:i:s');
+
+        // Insert the single session row
+        $db->prepare("
+            INSERT INTO workout_sets
+              (workout_id, exercise_id, set_number, set_type, duration_sec, distance_km,
+               elevation_m, hr_avg, hr_max, intensity, notes, logged_at)
+            VALUES (?, ?, 1, 'working', ?, ?, ?, ?, ?, ?, ?, ?)
+        ")->execute([$workout_id, $exercise_id, $duration, $distance, $elevation, $hr_avg, $hr_max, $intensity, $notes, $now]);
+
+        // Finish the workout
+        $db->prepare("UPDATE workouts SET finished_at = ?, bodyweight_kg = ? WHERE id = ? AND finished_at IS NULL")
+           ->execute([$now, $bodyweight, $workout_id]);
+        if ($bodyweight) set_user_setting($db, 'bodyweight_kg', (string)$bodyweight);
+
+        // Update cardio PRs
+        maybe_update_cardio_pr($db, $exercise_id, $duration, $distance, $hr_avg, $intensity);
+
+        echo json_encode(['status' => 'success']);
+
     } elseif ($action === 'finish_workout') {
         $id = (int)($_POST['id'] ?? 0);
         if (!$id) throw new Exception('ID required');
@@ -126,6 +167,17 @@ try {
             } elseif ($s['weight_kg'] !== null && $s['reps'] !== null) {
                 maybe_update_pr($db, (int)$s['exercise_id'], (float)$s['weight_kg'], (int)$s['reps'], $formula);
             }
+        }
+
+        // Advance the A/B template counter now that the workout is actually finished.
+        // We stored which variant was used on the workout row at exercise-seed time so
+        // this is a no-op if the workout was never seeded from an A/B template.
+        $wk = $db->prepare("SELECT template_id, ab_variant FROM workouts WHERE id = ?");
+        $wk->execute([$id]);
+        $wk_row = $wk->fetch(PDO::FETCH_ASSOC);
+        if ($wk_row && $wk_row['template_id'] && $wk_row['ab_variant']) {
+            $db->prepare("UPDATE templates SET last_ab_variant = ? WHERE id = ?")
+               ->execute([$wk_row['ab_variant'], $wk_row['template_id']]);
         }
 
         echo json_encode(['status' => 'success']);
@@ -325,13 +377,15 @@ try {
             }
         }
 
+        $elevation   = (isset($_POST['elevation_m']) && $_POST['elevation_m'] !== '') ? (float)$_POST['elevation_m'] : null;
         $pr_int = $is_pr ? 1 : 0;
+        $logged_at = date('Y-m-d H:i:s');
         if ($set_id) {
-            $db->prepare("UPDATE workout_sets SET set_number=?, set_type=?, weight_kg=?, reps=?, rpe=?, duration_sec=?, distance_km=?, added_weight_kg=?, hr_avg=?, hr_max=?, intensity=?, notes=?, is_pr=? WHERE id=? AND workout_id=?")
-               ->execute([$set_number, $set_type, $weight_kg, $reps, $rpe, $duration, $distance, $added_weight_kg, $hr_avg, $hr_max, $intensity, $notes, $pr_int, $set_id, $workout_id]);
+            $db->prepare("UPDATE workout_sets SET set_number=?, set_type=?, weight_kg=?, reps=?, rpe=?, duration_sec=?, distance_km=?, added_weight_kg=?, hr_avg=?, hr_max=?, elevation_m=?, intensity=?, notes=?, is_pr=?, logged_at=? WHERE id=? AND workout_id=?")
+               ->execute([$set_number, $set_type, $weight_kg, $reps, $rpe, $duration, $distance, $added_weight_kg, $hr_avg, $hr_max, $elevation, $intensity, $notes, $pr_int, $logged_at, $set_id, $workout_id]);
         } else {
-            $db->prepare("INSERT INTO workout_sets (workout_id, exercise_id, set_number, set_type, weight_kg, reps, rpe, duration_sec, distance_km, added_weight_kg, hr_avg, hr_max, intensity, notes, is_pr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-               ->execute([$workout_id, $exercise_id, $set_number, $set_type, $weight_kg, $reps, $rpe, $duration, $distance, $added_weight_kg, $hr_avg, $hr_max, $intensity, $notes, $pr_int]);
+            $db->prepare("INSERT INTO workout_sets (workout_id, exercise_id, set_number, set_type, weight_kg, reps, rpe, duration_sec, distance_km, added_weight_kg, hr_avg, hr_max, elevation_m, intensity, notes, is_pr, logged_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+               ->execute([$workout_id, $exercise_id, $set_number, $set_type, $weight_kg, $reps, $rpe, $duration, $distance, $added_weight_kg, $hr_avg, $hr_max, $elevation, $intensity, $notes, $pr_int, $logged_at]);
             $set_id = (int)$db->lastInsertId();
         }
 
@@ -548,6 +602,34 @@ try {
         $db->prepare("INSERT INTO body_measurements (measured_at, waist_cm, neck_cm, hip_cm, caliper_bf_pct) VALUES (?,?,?,?,?)")
            ->execute([$measured_at, $waist, $neck, $hip, $caliper]);
         echo json_encode(['status' => 'success', 'data' => ['id' => (int)$db->lastInsertId()]]);
+
+    } elseif ($action === 'log_hr_sample') {
+        $workout_id  = (int)($_POST['workout_id'] ?? 0);
+        $samples_raw = $_POST['samples'] ?? '';
+        if (!$workout_id) throw new Exception('workout_id required');
+        $samples = json_decode($samples_raw, true);
+        if (!is_array($samples) || empty($samples)) throw new Exception('samples must be a non-empty JSON array');
+        $stmt = $db->prepare("INSERT INTO workout_hr_samples (workout_id, sampled_at, bpm) VALUES (?, ?, ?)");
+        $saved = 0;
+        foreach ($samples as $s) {
+            $bpm = (int)($s['bpm'] ?? 0);
+            $ts  = $s['sampled_at'] ?? date('Y-m-d H:i:s');
+            if ($bpm < 20 || $bpm > 250) continue;
+            $stmt->execute([$workout_id, $ts, $bpm]);
+            $saved++;
+        }
+        echo json_encode(['status' => 'success', 'saved' => $saved]);
+
+    } elseif ($action === 'log_hr_measurement') {
+        $type = $_POST['type'] ?? '';
+        $bpm  = (int)($_POST['bpm'] ?? 0);
+        if (!in_array($type, ['resting', 'max'])) throw new Exception('type must be resting or max');
+        if ($bpm < 20 || $bpm > 250) throw new Exception('bpm out of range');
+        $db->prepare("INSERT INTO hr_measurements (type, bpm, measured_at) VALUES (?, ?, ?)")
+           ->execute([$type, $bpm, date('Y-m-d H:i:s')]);
+        $setting_key = $type === 'resting' ? 'profile_resting_hr' : 'profile_max_hr';
+        set_user_setting($db, $setting_key, (string)$bpm);
+        echo json_encode(['status' => 'success', 'bpm' => $bpm]);
 
     } elseif ($action === 'delete_body_measurement') {
         $id = (int)($_POST['id'] ?? 0);

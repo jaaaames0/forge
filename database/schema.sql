@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS workouts (
     started_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
     finished_at DATETIME,
     notes       TEXT,
-    bodyweight_kg REAL
+    bodyweight_kg REAL,
+    type        TEXT DEFAULT 'strength', -- 'strength' | 'cardio'
+    ab_variant  TEXT DEFAULT NULL        -- 'A' or 'B'; set on exercise seed, written to templates on finish
 );
 
 CREATE TABLE IF NOT EXISTS workout_sets (
@@ -37,7 +39,10 @@ CREATE TABLE IF NOT EXISTS workout_sets (
     hr_avg           INTEGER DEFAULT NULL,
     hr_max           INTEGER DEFAULT NULL,
     intensity        INTEGER DEFAULT NULL, -- 1-10 effort/resistance rating (cardio)
-    notes            TEXT
+    elevation_m      REAL DEFAULT NULL,    -- elevation gain in metres (cardio)
+    is_pr            INTEGER NOT NULL DEFAULT 0,  -- 1 if this set set an all-time estimated 1RM PR
+    notes            TEXT,
+    logged_at        TEXT DEFAULT NULL     -- timestamp when set was ticked (for HR chart overlays)
 );
 
 CREATE TABLE IF NOT EXISTS cardio_records (
@@ -53,10 +58,12 @@ CREATE TABLE IF NOT EXISTS cardio_records (
 );
 
 CREATE TABLE IF NOT EXISTS workout_exercises (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    workout_id  INTEGER NOT NULL REFERENCES workouts(id) ON DELETE CASCADE,
-    exercise_id INTEGER NOT NULL REFERENCES exercises(id),
-    order_num   INTEGER DEFAULT 0,
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    workout_id                  INTEGER NOT NULL REFERENCES workouts(id) ON DELETE CASCADE,
+    exercise_id                 INTEGER NOT NULL REFERENCES exercises(id),
+    order_num                   INTEGER DEFAULT 0,
+    target_sets                 INTEGER DEFAULT 3,
+    progression_applied_weight  REAL DEFAULT NULL,
     UNIQUE(workout_id, exercise_id)
 );
 
@@ -104,6 +111,21 @@ CREATE TABLE IF NOT EXISTS body_measurements (
     hip_cm          REAL,
     caliper_bf_pct  REAL    -- user-entered BF% from skinfold calipers
 );
+
+CREATE TABLE IF NOT EXISTS hr_measurements (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    type        TEXT NOT NULL,       -- 'resting' or 'max'
+    bpm         INTEGER NOT NULL,
+    measured_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS workout_hr_samples (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    workout_id  INTEGER NOT NULL REFERENCES workouts(id) ON DELETE CASCADE,
+    sampled_at  TEXT NOT NULL,
+    bpm         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_whr_workout ON workout_hr_samples(workout_id, sampled_at);
 
 -- Default settings
 INSERT OR IGNORE INTO user_settings (key, value) VALUES ('unit', 'kg');

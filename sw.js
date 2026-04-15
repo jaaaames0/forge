@@ -7,7 +7,7 @@
 let timerId = null;
 
 self.addEventListener('message', (event) => {
-    const { type, endMs } = event.data || {};
+    const { type, endMs, tag } = event.data || {};
 
     if (type === 'CANCEL_TIMER') {
         clearTimeout(timerId);
@@ -23,6 +23,13 @@ self.addEventListener('message', (event) => {
         } else {
             timerId = setTimeout(fireNotification, delay);
         }
+    }
+
+    // Dismiss a visible notification by tag (e.g. when user returns to app)
+    if (type === 'CLOSE_NOTIFICATION' && tag) {
+        self.registration.getNotifications({ tag }).then(list => {
+            list.forEach(n => n.close());
+        });
     }
 });
 

@@ -132,10 +132,24 @@ function maybe_migrate_schema(PDO $db): void {
         $db->exec("ALTER TABLE templates ADD COLUMN last_ab_variant TEXT DEFAULT NULL");
     }
 
-    // workout_sets.is_pr flag (persisted so PR highlights survive page return)
+    // workouts.ab_variant — records which A/B group was used for this session;
+    // only written to templates.last_ab_variant on finish (not on start) so
+    // cancelling a workout doesn't advance the A/B counter
+    $wk_cols = array_column($db->query("PRAGMA table_info(workouts)")->fetchAll(PDO::FETCH_ASSOC), 'name');
+    if (!in_array('ab_variant', $wk_cols)) {
+        $db->exec("ALTER TABLE workouts ADD COLUMN ab_variant TEXT DEFAULT NULL");
+    }
+
+    // workout_sets remaining columns
     $ws_cols = array_column($db->query("PRAGMA table_info(workout_sets)")->fetchAll(PDO::FETCH_ASSOC), 'name');
     if (!in_array('is_pr', $ws_cols)) {
         $db->exec("ALTER TABLE workout_sets ADD COLUMN is_pr INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!in_array('logged_at', $ws_cols)) {
+        $db->exec("ALTER TABLE workout_sets ADD COLUMN logged_at TEXT DEFAULT NULL");
+    }
+    if (!in_array('elevation_m', $ws_cols)) {
+        $db->exec("ALTER TABLE workout_sets ADD COLUMN elevation_m REAL DEFAULT NULL");
     }
 
     // body_measurements table

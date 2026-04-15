@@ -80,8 +80,10 @@ foreach ($big4 as $key => $lift) {
 $pr_board = $db->query("
     SELECT pr.exercise_id, pr.weight_kg, pr.reps, ROUND(pr.estimated_1rm, 1) as estimated_1rm,
            e.name as exercise_name, e.muscle_primary, e.category,
-           (SELECT COUNT(*) FROM workout_sets ws2
-            WHERE ws2.exercise_id = e.id AND ws2.set_type = 'working') as set_count
+           (SELECT COUNT(*) FROM personal_records p3
+            WHERE p3.exercise_id = e.id) as pr_count,
+           (SELECT MAX(achieved_at) FROM personal_records p4
+            WHERE p4.exercise_id = e.id) as last_pr_at
     FROM personal_records pr
     JOIN exercises e ON e.id = pr.exercise_id
     WHERE pr.id = (
@@ -90,7 +92,7 @@ $pr_board = $db->query("
         ORDER BY p2.estimated_1rm DESC LIMIT 1
     )
     AND pr.estimated_1rm > 0
-    ORDER BY set_count DESC, pr.estimated_1rm DESC
+    ORDER BY pr_count DESC, last_pr_at DESC
 ")->fetchAll(PDO::FETCH_ASSOC);
 
 // ── CARDIO PRs ─────────────────────────────────────────────────────────────
@@ -359,7 +361,7 @@ function standards_card(array $lift, array $level_names, string $unit): string {
                         <?php if ($pr['weight_kg'] && $pr['reps']): ?>
                         <?= round($pr['weight_kg'],1) ?> <?= $unit ?> × <?= $pr['reps'] ?> reps &nbsp;·&nbsp;
                         <?php endif; ?>
-                        <?= $pr['set_count'] ?> sets logged
+                        <?= $pr['pr_count'] ?> PR<?= $pr['pr_count'] != 1 ? 's' : '' ?> logged
                     </div>
                 </div>
                 <?php if ($pr['muscle_primary']): ?>

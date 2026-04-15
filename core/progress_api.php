@@ -281,6 +281,112 @@ try {
     // CARDIO HISTORY (time-series per exercise)
     // =========================================================
 
+    // =========================================================
+    // HR METRICS (per-exercise %HRR trend + HRRec)
+    // =========================================================
+
+    } elseif ($action === 'get_exercise_hrr') {
+        $exercise_id = (int)($_POST['exercise_id'] ?? 0);
+        if (!$exercise_id) throw new Exception('exercise_id required');
+
+        $resting_hr = (int)get_user_setting($db, 'profile_resting_hr', '0');
+        $max_hr     = (int)get_user_setting($db, 'profile_max_hr',     '0');
+
+        if ($resting_hr <= 0 || $max_hr <= $resting_hr) {
+            echo json_encode(['status' => 'success', 'data' => [], 'reason' => 'no_profile_hr']);
+            exit;
+        }
+
+        // Per-session avg %HRR across working sets that have hr_max
+        $stmt = $db->prepare("
+            SELECT w.id as workout_id,
+                   DATE(w.started_at) as date,
+                   ROUND(AVG((ws.hr_max - :resting) * 100.0 / (:max_hr - :resting)), 1) as avg_hrr_pct,
+                   COUNT(ws.id) as set_count
+            FROM workout_sets ws
+            JOIN workouts w ON w.id = ws.workout_id
+            WHERE ws.exercise_id   = :exercise_id
+              AND ws.set_type      = 'working'
+              AND ws.hr_max        IS NOT NULL
+              AND w.finished_at    IS NOT NULL
+            GROUP BY w.id
+            ORDER BY w.started_at ASC
+        ");
+        $stmt->execute([':exercise_id' => $exercise_id, ':resting' => $resting_hr, ':max_hr' => $max_hr]);
+        $sessions = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        if (empty($sessions)) {
+            echo json_encode(['status' => 'success', 'data' => [], 'resting_hr' => $resting_hr, 'max_hr' => $max_hr]);
+            exit;
+        }
+
+        // HRRec: for each session, find HR at ~60s after each set completion and compute drop
+        // logged_at is AEST (PHP), sampled_at is UTC (JS toISOString) — handle both
+        $workout_ids = array_column($sessions, 'workout_id');
+        $phs = implode(',', array_fill(0, count($workout_ids), '?'));
+
+        $s2 = $db->prepare("
+            SELECT workout_id, hr_max, logged_at
+            FROM workout_sets
+            WHERE workout_id IN ($phs) AND exercise_id = ?
+              AND set_type = 'working' AND hr_max IS NOT NULL AND logged_at IS NOT NULL
+            ORDER BY workout_id, logged_at
+        ");
+        $s2->execute([...$workout_ids, $exercise_id]);
+        $sets_timed = $s2->fetchAll(PDO::FETCH_ASSOC);
+
+        $s3 = $db->prepare("
+            SELECT workout_id, sampled_at, bpm
+            FROM workout_hr_samples WHERE workout_id IN ($phs)
+            ORDER BY workout_id, sampled_at
+        ");
+        $s3->execute($workout_ids);
+
+        // Group HR samples by workout_id, pre-converting to unix timestamps (UTC)
+        $hr_by_wid = [];
+        foreach ($s3->fetchAll(PDO::FETCH_ASSOC) as $s) {
+            $hr_by_wid[(int)$s['workout_id']][] = [
+                'ts'  => strtotime($s['sampled_at'] . ' UTC'),
+                'bpm' => (int)$s['bpm'],
+            ];
+        }
+
+        // Group sets by workout_id
+        $sets_by_wid = [];
+        foreach ($sets_timed as $s) {
+            $sets_by_wid[(int)$s['workout_id']][] = $s;
+        }
+
+        // Compute avg HRRec (bpm drop at 60s post-set) per session
+        $hrrec_by_wid = [];
+        foreach ($sets_by_wid as $wid => $wsets) {
+            $samples = $hr_by_wid[$wid] ?? [];
+            if (empty($samples)) continue;
+            $recoveries = [];
+            foreach ($wsets as $ws) {
+                $target_ts = strtotime($ws['logged_at']) + 60; // AEST + 60s
+                $best_bpm = null; $best_diff = PHP_INT_MAX;
+                foreach ($samples as $sp) {
+                    $diff = abs($sp['ts'] - $target_ts);
+                    if ($diff < $best_diff) { $best_diff = $diff; $best_bpm = $sp['bpm']; }
+                }
+                if ($best_diff <= 20 && $best_bpm !== null) {
+                    $rec = (int)$ws['hr_max'] - $best_bpm;
+                    if ($rec > 0) $recoveries[] = $rec;
+                }
+            }
+            if (!empty($recoveries)) {
+                $hrrec_by_wid[$wid] = round(array_sum($recoveries) / count($recoveries), 1);
+            }
+        }
+
+        foreach ($sessions as &$s) {
+            $s['hrrec'] = $hrrec_by_wid[(int)$s['workout_id']] ?? null;
+        }
+        unset($s);
+
+        echo json_encode(['status' => 'success', 'data' => $sessions, 'resting_hr' => $resting_hr, 'max_hr' => $max_hr]);
+
     } elseif ($action === 'get_cardio_history') {
         $exercise_id = (int)($_POST['exercise_id'] ?? 0);
         if (!$exercise_id) throw new Exception('exercise_id required');

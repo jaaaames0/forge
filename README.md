@@ -2,7 +2,7 @@
 
 Self-hosted gym and workout tracking web app. Built for personal use on a phone at the gym. Sister app to [SPENCE](../spence/).
 
-Current release: **v0.4.0**.
+Current release: **v0.5.0**.
 
 ![PHP](https://img.shields.io/badge/PHP-8.2+-777BB4?logo=php&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-3-003B57?logo=sqlite&logoColor=white)
@@ -14,12 +14,17 @@ Current release: **v0.4.0**.
 - Rest timer that persists when navigating between pages
 - Optional rest alerts: in-app bell + background system notification
 - Progression suggestions (linear, double progression, RPE-based)
+- Post-exercise completion guidance with the next-session progression target
+- Replace an unstarted exercise mid-workout without losing workout flow
 - e1RM tracking and personal record detection
 - Session PR highlights (trophy on PR sets)
 - Dynamic active workout bar with "next up" guidance
 - Exercise stats: best sets, estimated 1RM history, volume trends
 - Full session history per exercise
+- Point-in-time exercise comparison: e1RM, bodyweight, estimated lean mass, and relative strength
 - Body composition tracking (waist/neck/hip measurements, Navy BF% formula)
+- Training eras and automatically detected bulk, cut, recomposition, and detraining cycles
+- Cycle-scoped history, progress views, comparisons, bodyweight/lean-mass metrics, and a reviewable reanalysis proposal
 - Live cardio sessions with stopwatch, HR zone display, and finish modal (distance, elevation, intensity)
 - Cardio PRs: best distance, best speed, cardiac efficiency
 - Web Bluetooth HR monitor integration — pairs once, auto-reconnects; live BPM in workout header, per-set %HRR badges, session HR timeline in history
@@ -69,10 +74,10 @@ chmod 666 database/forge.db
 
 ### 3. Auth key
 
-Create `core/credentials.env`:
+Create `/srv/secrets/forge_credentials.env` containing the access key:
 
 ```
-FORGE_ACCESS_KEY=your_secret_passphrase_here
+your_secret_passphrase_here
 ```
 
 Or set it as an environment variable: `FORGE_ACCESS_KEY=...`
@@ -106,6 +111,14 @@ Open FORGE in Chrome, tap the three-dot menu → **Add to Home screen**. The app
 
 On iOS Safari: Share → **Add to Home Screen**.
 
+### Rest alerts
+
+When FORGE is visible, rest completion uses the in-app bell and vibration. In the
+background, the page and service worker both attempt to deliver a system
+notification. Browsers can suspend background workers, so this is best-effort;
+guaranteed delivery after the browser is closed requires a server-side Web Push
+scheduler with VAPID credentials.
+
 ## Directory structure
 
 ```
@@ -118,6 +131,8 @@ progress/       e1RM trends, volume, body comp, cardio PRs
 profile/        User profile + body metrics + rest alert toggles
 hr/             Web Bluetooth HR monitor tech demo
 settings/       Redirects to profile (settings were moved in v0.3.0)
+scripts/        Import, repair, seed, and training-cycle analysis utilities
+tests/          Lightweight SQLite-backed regression checks
 sw.js           Service worker for background rest notifications
 database/       schema.sql, forge_empty.db (forge.db is gitignored)
 ```
@@ -133,6 +148,15 @@ Settings stored in `user_settings` table. Common keys currently used:
 | `rest_compound_sec` | `240` | Rest timer for compound lifts |
 | `rest_bodyweight_sec` | `180` | Rest timer for bodyweight exercises |
 | `rest_isolation_sec` | `120` | Rest timer for isolation exercises |
+
+## Cycle reanalysis
+
+FORGE keeps the active cycle current as workouts are finished. When you want to
+reassess historical boundaries, use the refresh icon beside **All Cycles** in
+History → Cycles. It runs the detector as a dry run, shows the saved cycles
+that would be replaced alongside the proposed cycles, and requires explicit
+confirmation before saving. This is useful after a deliberate bulk/cut change;
+it never silently replaces historical cycle boundaries.
 
 ## Gitignored files
 

@@ -1,6 +1,7 @@
 <?php
 require_once __DIR__ . '/../core/auth.php';
 require_once __DIR__ . '/../core/db_helper.php';
+require_once __DIR__ . '/../core/cycle_analysis.php';
 
 $db       = get_db_connection();
 $unit     = 'kg';
@@ -17,6 +18,7 @@ function fmtVol(float $v, string $unit): string {
 
 $workout_id  = isset($_GET['id'])          ? (int)$_GET['id']          : null;
 $exercise_id = isset($_GET['exercise_id']) ? (int)$_GET['exercise_id'] : null;
+$tab = ($_GET['tab'] ?? 'workouts') === 'cycles' ? 'cycles' : 'workouts';
 
 // ============================================================
 // EXERCISE HISTORY VIEW
@@ -29,7 +31,7 @@ if ($exercise_id) {
 
     // All sessions containing this exercise, with sets
     $sess_stmt = $db->prepare("
-        SELECT w.id, w.name, w.started_at, w.finished_at
+        SELECT w.id, w.name, w.started_at, w.finished_at, w.bodyweight_kg, w.era_id
         FROM workouts w
         WHERE w.finished_at IS NOT NULL
           AND EXISTS (SELECT 1 FROM workout_sets ws WHERE ws.workout_id = w.id AND ws.exercise_id = ?)
@@ -52,8 +54,39 @@ if ($exercise_id) {
     foreach ($sessions as &$s) {
         $set_stmt->execute([$s['id'], $exercise_id]);
         $s['sets'] = $set_stmt->fetchAll(PDO::FETCH_ASSOC);
+        $best_1rm = 0.0; $best_set = null;
+        foreach ($s['sets'] as $set) if ($set['set_type'] === 'working' && $set['estimated_1rm'] !== null && (float)$set['estimated_1rm'] > $best_1rm) {
+            $best_1rm = (float)$set['estimated_1rm']; $best_set = $set;
+        }
+        $bodyweight = $s['bodyweight_kg'] !== null ? (float)$s['bodyweight_kg'] : forge_cycle_bodyweight($db, (int)$s['era_id'], $s['started_at']);
+        $bf = forge_cycle_bodyfat($db, (int)$s['era_id'], $s['started_at']);
+        $lean_mass = ($bodyweight !== null && $bf !== null) ? round($bodyweight * (1 - $bf / 100), 1) : null;
+        $s['best_1rm'] = round($best_1rm, 1); $s['best_set'] = $best_set;
+        $s['bodyweight'] = $bodyweight; $s['bodyfat'] = $bf; $s['lean_mass'] = $lean_mass;
+        $s['e1rm_per_bw'] = $bodyweight && $best_1rm > 0 ? round($best_1rm / $bodyweight, 2) : null;
+        $s['e1rm_per_lbm'] = $lean_mass && $best_1rm > 0 ? round($best_1rm / $lean_mass, 2) : null;
     }
     unset($s);
+
+    $exercise_cycles = $db->query('SELECT id, era_id, starts_at, ends_at, cycle_type FROM training_cycles ORDER BY starts_at')->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($sessions as &$s) {
+        $s['cycle_id'] = null; $s['cycle_type'] = null;
+        foreach ($exercise_cycles as $cycle) {
+            if ((int)$cycle['era_id'] === (int)$s['era_id'] && $s['started_at'] >= $cycle['starts_at'] && $s['started_at'] <= $cycle['ends_at']) {
+                $s['cycle_id'] = (int)$cycle['id']; $s['cycle_type'] = $cycle['cycle_type']; break;
+            }
+        }
+    }
+    unset($s);
+
+    $session_by_id = [];
+    foreach ($sessions as $session) $session_by_id[(int)$session['id']] = $session;
+    $compare_a_id = (int)($_GET['compare_a'] ?? ($sessions[0]['id'] ?? 0));
+    $compare_b_id = (int)($_GET['compare_b'] ?? 0);
+    $compare_a = $session_by_id[$compare_a_id] ?? null;
+    $compare_b = $session_by_id[$compare_b_id] ?? null;
+    $reference_e1rm = $compare_a['best_1rm'] ?? 0;
+    $similar_sessions = $reference_e1rm > 0 ? array_values(array_filter($sessions, fn($s) => (int)$s['id'] !== $compare_a_id && $s['cycle_id'] !== $compare_a['cycle_id'] && abs($s['best_1rm'] - $reference_e1rm) / $reference_e1rm <= 0.05)) : [];
 
     $page_title   = $ex['name'] . ' — History';
     $page_context = 'history';
@@ -75,21 +108,43 @@ if ($exercise_id) {
     <?php if (empty($sessions)): ?>
     <div class="text-center py-4 text-muted">No sessions logged yet.</div>
     <?php else: ?>
+    <details class="card mb-3"<?= $compare_b ? ' open' : '' ?>><summary class="card-body py-3 px-3 stat-label" style="cursor:pointer;">POINT-IN-TIME COMPARISON</summary><div class="card-body pt-0 px-3">
+        <form method="get"><input type="hidden" name="exercise_id" value="<?= $exercise_id ?>">
+            <div class="row g-2 align-items-end"><div class="col-5"><label class="stat-label d-block mb-1">POINT A</label><select name="compare_a" style="width:100%;min-height:44px;background:#1e1e1e;color:#e0e0e0;border:1px solid #444;border-radius:5px;padding:7px;font-size:.72rem;">
+                <?php foreach ($sessions as $s): ?><option value="<?= $s['id'] ?>"<?= (int)$s['id'] === $compare_a_id ? ' selected' : '' ?>><?= date('j M y',strtotime($s['started_at'])) ?> · <?= $s['cycle_type'] ? forge_cycle_label($s['cycle_type']) . ' · ' : '' ?><?= round((float)$s['best_1rm'], 1) ?> kg</option><?php endforeach; ?>
+            </select></div><div class="col-5"><label class="stat-label d-block mb-1">POINT B</label><select name="compare_b" style="width:100%;min-height:44px;background:#1e1e1e;color:#e0e0e0;border:1px solid #444;border-radius:5px;padding:7px;font-size:.72rem;"><option value="0">Choose a session</option>
+                <?php foreach ($sessions as $s): ?><option value="<?= $s['id'] ?>"<?= (int)$s['id'] === $compare_b_id ? ' selected' : '' ?>><?= date('j M y',strtotime($s['started_at'])) ?> · <?= $s['cycle_type'] ? forge_cycle_label($s['cycle_type']) . ' · ' : '' ?><?= round((float)$s['best_1rm'], 1) ?> kg</option><?php endforeach; ?>
+            </select></div><div class="col-2"><button type="submit" class="btn btn-forge btn-sm w-100 px-1">GO</button></div></div>
+        </form>
+        <?php if ($compare_a && $compare_b && (int)$compare_a['id'] !== (int)$compare_b['id']): ?>
+        <div class="mt-3 pt-2" style="border-top:1px solid #222;">
+            <?php foreach (['e1RM' => 'best_1rm', 'Bodyweight' => 'bodyweight', 'Lean mass*' => 'lean_mass', 'e1RM / BW' => 'e1rm_per_bw', 'e1RM / LBM*' => 'e1rm_per_lbm'] as $label => $key): $a=$compare_a[$key]; $b=$compare_b[$key]; $is_mass=in_array($key,['best_1rm','bodyweight','lean_mass'],true); $higher_is_better=$key !== 'bodyweight'; $delta=($a!==null&&$b!==null)?round((float)$b-(float)$a,2):null; $pct=($a!==null&&$b!==null&&(float)$a!==0)?round($delta/(float)$a*100,1):null; $a_color=$b_color='#e0e0e0'; if($delta!==null&&$delta!==0&&$higher_is_better){$a_color=$delta>0?'#ef5350':'#81c784';$b_color=$delta>0?'#81c784':'#ef5350';} ?>
+                <div class="d-grid align-items-center py-2" style="grid-template-columns:1fr auto 1fr;border-top:1px solid #1a1a1a;font-size:.78rem;"><strong style="text-align:left;color:<?= $a_color ?>;"><?= $a === null ? '—' : round((float)$a, 2) ?><?= $is_mass ? ' kg' : '' ?><?php if($delta!==null&&$delta!==0&&$higher_is_better): ?><small style="display:block;font-size:.6rem;"><?= $delta>0 ? '-' : '+' ?><?= $is_mass ? abs(round($delta,1)).' kg' : abs($pct).'%' ?></small><?php endif; ?></strong><span class="stat-label px-2" style="font-size:.55rem;text-align:center;white-space:nowrap;"><?= $label ?></span><strong style="text-align:right;color:<?= $b_color ?>;"><?= $b === null ? '—' : round((float)$b, 2) ?><?= $is_mass ? ' kg' : '' ?><?php if($delta!==null&&$delta!==0&&$higher_is_better): ?><small style="display:block;font-size:.6rem;"><?= $delta>0 ? '+' : '-' ?><?= $is_mass ? abs(round($delta,1)).' kg' : abs($pct).'%' ?></small><?php endif; ?></strong></div>
+            <?php endforeach; ?>
+            <div class="text-muted mt-2" style="font-size:.62rem;">* Lean mass uses caliper body-fat measurements interpolated between logged points.</div>
+        </div>
+        <?php endif; ?>
+    </div>
+
+    <?php if ($compare_a && $similar_sessions): ?>
+    <div class="px-3 pb-2">
+    <div class="stat-label mt-3 mb-1">SIMILAR ABSOLUTE STRENGTH · <?= round((float)$compare_a['best_1rm'],1) ?> KG e1RM</div>
+    <div class="py-1">
+        <?php foreach (array_slice($similar_sessions, 0, 6) as $s): ?><div class="d-flex justify-content-between align-items-center py-2" style="border-top:1px solid #1a1a1a;font-size:.72rem;"><span><?= date('j M Y',strtotime($s['started_at'])) ?></span><span class="text-muted">BW <?= $s['bodyweight'] === null ? '—' : round((float)$s['bodyweight'], 1) ?> kg · <?= $s['e1rm_per_bw'] === null ? '—' : round((float)$s['e1rm_per_bw'], 2) ?>× BW</span><a href="?exercise_id=<?= $exercise_id ?>&compare_a=<?= $compare_a['id'] ?>&compare_b=<?= $s['id'] ?>" style="color:#FF5722;font-weight:700;text-decoration:none;">COMPARE</a></div><?php endforeach; ?>
+    </div>
+    </div>
+    <?php endif; ?>
+    </details>
+
     <?php foreach ($sessions as $s):
-        $has_working = array_filter($s['sets'], fn($r) => $r['set_type'] === 'working' && $r['weight_kg'] > 0 && $r['reps']);
-        $best_1rm = 0; $best_set = null;
-        foreach ($s['sets'] as $r) {
-            if ($r['set_type'] === 'working' && $r['estimated_1rm'] !== null && (float)$r['estimated_1rm'] > $best_1rm) {
-                $best_1rm = (float)$r['estimated_1rm'];
-                $best_set = $r;
-            }
-        }
+        $best_1rm = $s['best_1rm']; $best_set = $s['best_set'];
     ?>
     <div class="card mb-2">
         <div class="card-body py-2 px-3">
             <div class="d-flex justify-content-between align-items-center mb-2">
                 <div>
                     <div class="fw-black" style="font-size:0.85rem; color:#e0e0e0;"><?= date('D j M Y', strtotime($s['started_at'])) ?></div>
+                    <?php if ($s['bodyweight'] !== null): ?><div style="font-size:0.67rem;color:#81c784;font-weight:700;">BW <?= round((float)$s['bodyweight'], 1) ?> kg · <?= $s['e1rm_per_bw'] ?? '—' ?>×</div><?php endif; ?>
                     <?php if ($best_set): ?>
                     <div class="text-muted" style="font-size:0.7rem;">best: <?= $best_set['weight_kg'] ?> kg × <?= $best_set['reps'] ?> — e1RM <?= $best_set['estimated_1rm'] ?> kg</div>
                     <?php endif; ?>
@@ -130,6 +185,26 @@ if ($exercise_id) {
     $stmt->execute([$workout_id]);
     $workout = $stmt->fetch(PDO::FETCH_ASSOC);
     if (!$workout) { header("Location: /forge/history/"); exit; }
+
+    $workout_bw = $workout['bodyweight_kg'] !== null ? (float)$workout['bodyweight_kg'] : null;
+    $workout_bw_source = $workout_bw !== null ? 'logged' : null;
+    if ($workout_bw === null) {
+        $before = $db->prepare("SELECT measured_at, weight_kg FROM bodyweight_measurements WHERE era_id = ? AND measured_at <= ? ORDER BY measured_at DESC LIMIT 1");
+        $after = $db->prepare("SELECT measured_at, weight_kg FROM bodyweight_measurements WHERE era_id = ? AND measured_at >= ? ORDER BY measured_at ASC LIMIT 1");
+        $before->execute([(int)$workout['era_id'], $workout['started_at']]);
+        $after->execute([(int)$workout['era_id'], $workout['started_at']]);
+        $a = $before->fetch(PDO::FETCH_ASSOC); $b = $after->fetch(PDO::FETCH_ASSOC);
+        if ($a && $b) {
+            $at = strtotime($workout['started_at']); $ta = strtotime($a['measured_at']); $tb = strtotime($b['measured_at']);
+            $fraction = $ta === $tb ? 0 : ($at - $ta) / ($tb - $ta);
+            $workout_bw = (float)$a['weight_kg'] + $fraction * ((float)$b['weight_kg'] - (float)$a['weight_kg']);
+            $workout_bw_source = 'interpolated';
+        } elseif ($a || $b) {
+            $point = $a ?: $b;
+            $workout_bw = (float)$point['weight_kg'];
+            $workout_bw_source = 'nearest available';
+        }
+    }
 
     $stmt = $db->prepare("
         SELECT ws.*, e.name as exercise_name, e.muscle_primary, e.category
@@ -251,6 +326,9 @@ if ($exercise_id) {
             <div class="text-muted" style="font-size:0.8rem;">
                 <?= date('D j M Y · ' . $time_fmt, strtotime($workout['started_at'])) ?>
             </div>
+            <?php if ($workout_bw !== null): ?>
+            <div style="font-size:0.72rem;color:#81c784;font-weight:700;margin-top:3px;">BW <?= round($workout_bw, 1) ?> kg <span style="color:#888;font-weight:400;">· <?= $workout_bw_source ?></span></div>
+            <?php endif; ?>
         </div>
         <button class="btn btn-sm" onclick="deleteWorkout(<?= $workout_id ?>)"
                 style="background:transparent; border:1px solid #333; color:#555; min-height:36px; padding:0 12px;">
@@ -552,12 +630,166 @@ async function deleteWorkout(id) {
 // ============================================================
 // LIST VIEW
 // ============================================================
+} elseif ($tab === 'cycles') {
+    $cycles = $db->query("SELECT c.*, e.name AS era_name FROM training_cycles c JOIN training_eras e ON e.id = c.era_id ORDER BY c.starts_at DESC")->fetchAll(PDO::FETCH_ASSOC);
+    $compare_raw = $_GET['compare'] ?? [];
+    if (!is_array($compare_raw)) $compare_raw = explode(',', (string)$compare_raw);
+    $compare_ids = array_values(array_unique(array_filter(array_map('intval', $compare_raw))));
+    $selected = array_values(array_filter($cycles, fn($cycle) => in_array((int)$cycle['id'], $compare_ids, true)));
+    $page_title = 'Cycle Analysis'; $page_context = 'history';
+    include __DIR__ . '/../core/page_head.php';
+?>
+<div class="container-fluid py-3 px-3" style="max-width:700px;margin:0 auto;">
+    <div class="d-flex align-items-baseline justify-content-between mb-3">
+        <h1 class="fw-black mb-0" style="font-size:1.6rem;letter-spacing:-1.5px;">HISTORY<span style="color:#FF5722;">_</span></h1>
+        <div class="text-muted" style="font-size:.72rem;">CYCLE ANALYSIS</div>
+    </div>
+    <div class="d-flex mb-3" style="background:#111;border-radius:8px;padding:3px;gap:3px;">
+        <a href="/forge/history/" class="seg-btn flex-fill text-decoration-none text-center">WORKOUTS</a>
+        <a href="/forge/history/?tab=cycles" class="seg-btn active flex-fill text-decoration-none text-center">CYCLES</a>
+    </div>
+
+    <div id="cycle-detection-preview" class="d-none card mb-3"><div class="card-body"></div></div>
+
+    <?php
+    $range_value = static function (array $m, string $start, string $end, string $unit): string {
+        return isset($m[$start], $m[$end]) ? round((float)$m[$start], 1) . ' → ' . round((float)$m[$end], 1) . $unit : '—';
+    };
+    ?>
+    <div class="d-flex align-items-center justify-content-between mb-2">
+        <div class="stat-label mb-0">ALL CYCLES</div>
+        <div class="d-flex align-items-center gap-1">
+            <?php if ($compare_ids): ?><span class="text-muted" style="font-size:.7rem;"><?= count($compare_ids) ?>/3 selected</span><?php endif; ?>
+            <button id="reanalyse-cycles-btn" class="btn-icon" type="button" onclick="previewCycleDetection()" aria-label="Reanalyse cycles" title="Reanalyse cycles"><i class="bi bi-arrow-repeat" style="font-size:.9rem;color:#888;"></i></button>
+        </div>
+    </div>
+    <?php foreach ($cycles as $cycle):
+        $m = json_decode($cycle['metrics_json'] ?? '{}', true) ?: [];
+        $color = $cycle['cycle_type'] === 'bulk' ? '#81c784' : ($cycle['cycle_type'] === 'cut' ? '#64b5f6' : '#ce93d8');
+        $is_compared = in_array((int)$cycle['id'], $compare_ids, true);
+        $weight_change = isset($m['start_weight'], $m['end_weight']) ? (float)$m['end_weight'] - (float)$m['start_weight'] : null;
+    ?>
+    <details class="card cycle-card mb-2 <?= $is_compared ? 'cycle-card-selected' : '' ?>" style="border-left-color:<?= $color ?>;">
+        <summary class="card-body py-2 px-3 cycle-card-summary">
+            <div class="d-flex align-items-start justify-content-between gap-2">
+                <div>
+                    <strong style="font-size:.78rem;color:<?= $color ?>;"><?= strtoupper(forge_cycle_label($cycle['cycle_type'])) ?></strong>
+                    <div class="cycle-summary-meta"><?= date('j M Y', strtotime($cycle['starts_at'])) ?> – <?= date('j M Y', strtotime($cycle['ends_at'])) ?></div>
+                </div>
+                <form method="get" onclick="event.stopPropagation();" class="m-0">
+                    <input type="hidden" name="tab" value="cycles">
+                    <?php foreach ($compare_ids as $id): if ($is_compared && $id === (int)$cycle['id']) continue; ?><input type="hidden" name="compare[]" value="<?= $id ?>"><?php endforeach; ?>
+                    <?php if (!$is_compared && count($compare_ids) < 3): ?><input type="hidden" name="compare[]" value="<?= $cycle['id'] ?>"><?php endif; ?>
+                    <?php if ($is_compared || count($compare_ids) < 3): ?><button class="btn <?= $is_compared ? 'btn-forge-outline' : 'btn-forge' ?> btn-sm cycle-compare-toggle" aria-label="<?= $is_compared ? 'Remove from comparator' : 'Add to comparator' ?>"><?= $is_compared ? '−' : '+' ?></button><?php endif; ?>
+                </form>
+            </div>
+            <div class="cycle-summary-stats mt-2">
+                <strong><?= (int)($m['sessions'] ?? 0) ?></strong> sessions · <strong><?= round((float)($m['sessions_per_week'] ?? 0), 1) ?></strong>/wk · <strong><?= number_format((float)($m['volume_kg'] ?? 0) / 1000, 1) ?>k</strong> kg · BW <strong><?= $weight_change === null ? '—' : (($weight_change >= 0 ? '+' : '') . round($weight_change, 1) . ' kg') ?></strong>
+            </div>
+        </summary>
+        <div class="card-body pt-0 px-3">
+            <div class="row g-0 cycle-detail-grid">
+                <section class="col-md-6 cycle-detail-section pe-md-3 py-2">
+                    <div class="stat-label mb-1">BODY COMPOSITION</div>
+                    <div class="cycle-detail-row"><span>Bodyweight</span><span class="cycle-detail-value"><?= $range_value($m, 'start_weight', 'end_weight', ' kg') ?></span></div>
+                    <div class="cycle-detail-row"><span>Weekly BW change</span><span class="cycle-detail-value"><?= isset($m['weekly_rate_kg']) ? (($m['weekly_rate_kg'] >= 0 ? '+' : '') . round((float)$m['weekly_rate_kg'], 2) . ' kg') : '—' ?></span></div>
+                    <div class="cycle-detail-row"><span>Body fat</span><span class="cycle-detail-value"><?= $range_value($m, 'body_fat_start_pct', 'body_fat_end_pct', '%') ?></span></div>
+                    <div class="cycle-detail-row"><span>Estimated lean mass</span><span class="cycle-detail-value"><?= $range_value($m, 'start_lean_mass_kg', 'end_lean_mass_kg', ' kg') ?></span></div>
+                </section>
+                <section class="col-md-6 cycle-detail-section ps-md-3 py-2">
+                    <div class="stat-label mb-1">TRAINING &amp; STRENGTH</div>
+                    <div class="cycle-detail-row"><span>Sessions / week</span><span class="cycle-detail-value"><?= (int)($m['sessions'] ?? 0) ?> · <?= round((float)($m['sessions_per_week'] ?? 0), 1) ?>/wk</span></div>
+                    <div class="cycle-detail-row"><span>Working sets</span><span class="cycle-detail-value"><?= (int)($m['working_sets'] ?? 0) ?></span></div>
+                    <div class="cycle-detail-row"><span>Volume</span><span class="cycle-detail-value"><?= number_format((float)($m['volume_kg'] ?? 0) / 1000, 1) ?>k kg</span></div>
+                    <div class="cycle-detail-row"><span>Big Four average</span><span class="cycle-detail-value" style="color:<?= ($m['strength_change_pct'] ?? 0) >= 0 ? '#81c784' : '#ef5350' ?>;"><?= isset($m['strength_change_pct']) ? (($m['strength_change_pct'] >= 0 ? '+' : '') . round((float)$m['strength_change_pct'], 1) . '%') : '—' ?></span></div>
+                    <?php foreach (FORGE_CYCLE_BIG_FOUR as $lift): if (!isset($m['lift_metrics'][$lift])) continue; $lm = $m['lift_metrics'][$lift]; ?>
+                    <div class="cycle-detail-row"><span><?= htmlspecialchars(str_replace('Barbell ', '', $lift)) ?> e1RM</span><span class="cycle-detail-value"><?= round((float)$lm['start_e1rm'], 1) ?> → <?= round((float)$lm['end_e1rm'], 1) ?> kg · <span style="color:<?= $lm['change_pct'] >= 0 ? '#81c784' : '#ef5350' ?>;"><?= $lm['change_pct'] >= 0 ? '+' : '' ?><?= round((float)$lm['change_pct'], 1) ?>%</span></span></div>
+                    <?php endforeach; ?>
+                </section>
+            </div>
+        </div>
+    </details>
+    <?php endforeach; ?>
+
+    <?php if (count($selected) >= 2): ?>
+    <div class="stat-label mb-2 mt-3">COMPARISON</div>
+    <div class="card mb-3 cycle-comparison"><div class="card-body p-0">
+        <table style="width:100%;border-collapse:collapse;font-size:.72rem;">
+            <thead><tr><th style="padding:10px;text-align:left;color:#888;">METRIC</th><?php foreach ($selected as $cycle): ?><th style="padding:10px;text-align:right;color:<?= $cycle['cycle_type']==='bulk'?'#81c784':($cycle['cycle_type']==='cut'?'#64b5f6':'#ce93d8') ?>;"><?= strtoupper(forge_cycle_label($cycle['cycle_type'])) ?><br><span style="color:#888;font-weight:400;"><?= date('j M Y',strtotime($cycle['starts_at'])) ?> – <?= date('j M Y',strtotime($cycle['ends_at'])) ?></span><form method="get" class="mt-1"><input type="hidden" name="tab" value="cycles"><?php foreach ($compare_ids as $id): if ($id !== (int)$cycle['id']): ?><input type="hidden" name="compare[]" value="<?= $id ?>"><?php endif; endforeach; ?><button class="btn btn-forge-outline btn-sm cycle-compare-toggle" aria-label="Remove <?= htmlspecialchars(forge_cycle_label($cycle['cycle_type'])) ?> from comparator">−</button></form></th><?php endforeach; ?></tr></thead>
+            <tbody>
+            <?php
+            $rows = [
+                'Bodyweight' => fn($m) => $range_value($m, 'start_weight', 'end_weight', ' kg'),
+                'Weekly BW change' => fn($m) => isset($m['weekly_rate_kg']) ? ($m['weekly_rate_kg'] >= 0 ? '+' : '').round((float)$m['weekly_rate_kg'], 2).' kg' : '—',
+                'Body fat' => fn($m) => $range_value($m, 'body_fat_start_pct', 'body_fat_end_pct', '%'),
+                'Estimated lean mass' => fn($m) => $range_value($m, 'start_lean_mass_kg', 'end_lean_mass_kg', ' kg'),
+                'Sessions / week' => fn($m) => (int)($m['sessions'] ?? 0).' · '.round((float)($m['sessions_per_week'] ?? 0), 1).'/wk',
+                'Working sets' => fn($m) => (string)($m['working_sets'] ?? '—'),
+                'Volume' => fn($m) => isset($m['volume_kg']) ? number_format((float)$m['volume_kg']/1000,1).'k kg' : '—',
+                'Big Four average' => fn($m) => isset($m['strength_change_pct']) ? (($m['strength_change_pct'] >= 0 ? '+' : '').round((float)$m['strength_change_pct'], 1).'%') : '—',
+            ];
+            foreach (FORGE_CYCLE_BIG_FOUR as $lift) $rows[str_replace('Barbell ', '', $lift)] = fn($m) => isset($m['lift_metrics'][$lift]) ? (round((float)$m['lift_metrics'][$lift]['start_e1rm'], 1).' → '.round((float)$m['lift_metrics'][$lift]['end_e1rm'], 1).' kg · '.(($m['lift_metrics'][$lift]['change_pct'] >= 0 ? '+' : '').round((float)$m['lift_metrics'][$lift]['change_pct'], 1).'%')) : '—';
+            foreach ($rows as $label => $format): ?>
+                <tr style="border-top:1px solid #1a1a1a;"><td style="padding:9px 10px;color:#888;"><?= htmlspecialchars($label) ?></td><?php foreach ($selected as $cycle): $m=json_decode($cycle['metrics_json']??'{}',true)?:[]; $value=$format($m); ?><td style="padding:9px 10px;text-align:right;color:<?= str_starts_with($value,'-') ? '#ef5350' : '#e0e0e0' ?>;"><?= htmlspecialchars($value) ?></td><?php endforeach; ?></tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div></div>
+    <?php endif; ?>
+
+<script>
+async function previewCycleDetection() {
+    const button = document.getElementById('reanalyse-cycles-btn');
+    const preview = document.getElementById('cycle-detection-preview');
+    const body = preview.querySelector('.card-body');
+    button.disabled = true; button.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+    const result = await window.forgeApi('preview_cycle_detection');
+    button.disabled = false; button.innerHTML = '<i class="bi bi-arrow-repeat" style="font-size:.9rem;color:#888;"></i>';
+    if (result.status !== 'success') { alert('Could not analyse cycles: ' + (result.message || 'Unknown error')); return; }
+    const data = result.data;
+    window.cycleProposalSignature = data.proposal_signature || '';
+    preview.classList.remove('d-none');
+    body.innerHTML = '';
+    const heading = document.createElement('div'); heading.className = 'stat-label mb-2'; heading.textContent = data.changed ? 'PROPOSED CYCLE UPDATE' : 'NO CYCLE CHANGES DETECTED'; body.appendChild(heading);
+    const copy = document.createElement('div'); copy.className = 'text-muted mb-2'; copy.style.fontSize = '.76rem'; copy.textContent = data.changed ? `${data.removed.length} saved cycle${data.removed.length === 1 ? '' : 's'} will be replaced by ${data.added.length} proposed cycle${data.added.length === 1 ? '' : 's'}.` : 'The detector agrees with the currently saved cycle boundaries.'; body.appendChild(copy);
+    if (data.changed) {
+        const makeList = (label, cycles, color) => { const section = document.createElement('div'); section.style.cssText = 'border-top:1px solid #333;padding-top:8px;margin-top:8px;'; const title = document.createElement('div'); title.className = 'stat-label mb-1'; title.style.color = color; title.textContent = label; section.appendChild(title); cycles.sort((a,b) => a.starts_at.localeCompare(b.starts_at)).forEach(cycle => { const row = document.createElement('div'); row.style.cssText = 'padding:6px 0;border-bottom:1px solid #292929;font-size:.74rem;'; row.textContent = `${cycle.cycle_type.toUpperCase()} · ${cycle.starts_at.slice(0,10)} – ${cycle.ends_at.slice(0,10)}`; section.appendChild(row); }); return section; };
+        if (data.removed.length) body.appendChild(makeList('SAVED CYCLES TO REPLACE', data.removed, '#ef5350'));
+        if (data.added.length) body.appendChild(makeList('PROPOSED AUTO CYCLES', data.added, '#81c784'));
+        const apply = document.createElement('button'); apply.className = 'btn btn-forge w-100 mt-3'; apply.textContent = 'APPLY PROPOSAL'; apply.onclick = applyCycleDetection; body.appendChild(apply);
+    }
+}
+async function applyCycleDetection() {
+    if (!confirm('Replace the saved automatic cycles with this proposal?')) return;
+    const result = await window.forgeApi('apply_cycle_detection', { proposal_signature: window.cycleProposalSignature || '' });
+    if (result.status !== 'success') { alert('Could not apply cycle proposal: ' + (result.message || 'Unknown error')); return; }
+    window.location.href = '/forge/history/?tab=cycles';
+}
+</script>
+
+</div>
+</body></html>
+<?php
 } else {
     $page   = max(1, (int)($_GET['page'] ?? 1));
+    $cycle_id = isset($_GET['cycle']) ? max(0, (int)$_GET['cycle']) : -1;
     $limit  = 20;
     $offset = ($page - 1) * $limit;
 
-    $total_sessions = (int)$db->query("SELECT COUNT(*) FROM workouts WHERE finished_at IS NOT NULL")->fetchColumn();
+    $cycles = $db->query("SELECT c.*, e.name AS era_name FROM training_cycles c JOIN training_eras e ON e.id=c.era_id ORDER BY c.starts_at DESC")->fetchAll(PDO::FETCH_ASSOC);
+    if ($cycle_id === -1) {
+        $current_era = active_training_era_id($db);
+        foreach ($cycles as $cycle) if ((int)$cycle['era_id'] === $current_era) { $cycle_id = (int)$cycle['id']; break; }
+    }
+    $selected_cycle = null;
+    foreach ($cycles as $cycle) if ((int)$cycle['id'] === $cycle_id) $selected_cycle = $cycle;
+    $filter_sql = $selected_cycle ? ' AND w.era_id = ? AND w.started_at >= ? AND w.started_at <= ?' : '';
+    $filter_params = $selected_cycle ? [(int)$selected_cycle['era_id'], $selected_cycle['starts_at'], $selected_cycle['ends_at']] : [];
+    $cycle_query = $selected_cycle ? '&cycle=' . (int)$selected_cycle['id'] : '';
+
+    $count_stmt = $db->prepare("SELECT COUNT(*) FROM workouts w WHERE w.finished_at IS NOT NULL{$filter_sql}");
+    $count_stmt->execute($filter_params);
+    $total_sessions = (int)$count_stmt->fetchColumn();
     $total_pages    = ceil($total_sessions / $limit);
 
     $stmt = $db->prepare("
@@ -570,12 +802,12 @@ async function deleteWorkout(id) {
                SUM(ws.elevation_m)  as total_elevation_m
         FROM workouts w
         LEFT JOIN workout_sets ws ON ws.workout_id = w.id
-        WHERE w.finished_at IS NOT NULL
+        WHERE w.finished_at IS NOT NULL{$filter_sql}
         GROUP BY w.id
         ORDER BY w.started_at DESC
         LIMIT ? OFFSET ?
     ");
-    $stmt->execute([$limit, $offset]);
+    $stmt->execute([...$filter_params, $limit, $offset]);
     $workouts = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
     $page_title   = 'History';
@@ -594,10 +826,25 @@ async function deleteWorkout(id) {
             <span class="fw-black text-accent" style="font-size:1.1rem;"><?= $total_sessions ?></span> sessions
         </div>
     </div>
+    <div class="d-flex mb-3" style="background:#111;border-radius:8px;padding:3px;gap:3px;">
+        <a href="/forge/history/" class="seg-btn active flex-fill text-decoration-none text-center">WORKOUTS</a>
+        <a href="/forge/history/?tab=cycles" class="seg-btn flex-fill text-decoration-none text-center">CYCLES</a>
+    </div>
+
+    <?php if ($cycles): ?>
+    <form method="get" action="/forge/history/" class="mb-3">
+        <input type="hidden" name="page" value="1">
+        <label class="stat-label d-block mb-1">CYCLE FILTER</label>
+        <select name="cycle" onchange="this.form.submit()" style="width:100%;background:#1e1e1e;color:#e0e0e0;border:1px solid #444;border-radius:5px;padding:8px;font-size:.78rem;">
+            <option value="0">All eras and cycles</option>
+            <?php foreach ($cycles as $cycle): ?><option value="<?= $cycle['id'] ?>"<?= (int)$cycle_id === (int)$cycle['id'] ? ' selected' : '' ?>><?= forge_cycle_label($cycle['cycle_type']) ?> · <?= date('M Y',strtotime($cycle['starts_at'])) ?>–<?= date('M Y',strtotime($cycle['ends_at'])) ?></option><?php endforeach; ?>
+        </select>
+    </form>
+    <?php endif; ?>
 
     <!-- Frequency calendar -->
     <div class="mb-3">
-        <div class="stat-label mb-2">WORKOUT CALENDAR (90 DAYS)</div>
+        <div class="stat-label mb-2">WORKOUT CALENDAR<?= $selected_cycle ? ' · SELECTED CYCLE' : ' · ALL TIME' ?></div>
         <div class="chart-container" style="padding:12px;">
             <canvas id="heatmap-canvas"></canvas>
         </div>
@@ -605,13 +852,24 @@ async function deleteWorkout(id) {
 
     <!-- Weekly volume chart -->
     <div class="mb-4">
-        <div class="stat-label mb-2">WEEKLY VOLUME (12 WEEKS)</div>
+        <div class="stat-label mb-2">WEEKLY VOLUME<?= $selected_cycle ? ' · SELECTED CYCLE' : ' · ALL TIME' ?></div>
         <div class="chart-container" style="padding:12px; height:150px;">
             <canvas id="chart-weekly"></canvas>
         </div>
     </div>
 
     <!-- Workout list -->
+    <?php if ($total_pages > 1): ?>
+    <div id="workout-list" class="d-flex justify-content-between align-items-center mb-3">
+        <?php if ($page > 1): ?><a href="?page=<?= $page-1 ?><?= $cycle_query ?>#workout-list" class="btn btn-forge-outline btn-sm px-3">← NEWER</a><?php else: ?><span></span><?php endif; ?>
+        <label class="text-muted x-small">PAGE
+            <select onchange="window.location.href='?page='+this.value+'<?= $cycle_query ?>#workout-list'" style="background:#1e1e1e;color:#888;border:1px solid #444;border-radius:3px;padding:2px 4px;">
+                <?php for ($p = 1; $p <= $total_pages; $p++): ?><option value="<?= $p ?>"<?= $p === $page ? ' selected' : '' ?>><?= $p ?> / <?= $total_pages ?></option><?php endfor; ?>
+            </select>
+        </label>
+        <?php if ($page < $total_pages): ?><a href="?page=<?= $page+1 ?><?= $cycle_query ?>#workout-list" class="btn btn-forge-outline btn-sm px-3">OLDER →</a><?php endif; ?>
+    </div>
+    <?php else: ?><div id="workout-list"></div><?php endif; ?>
     <?php if (empty($workouts) && $page === 1): ?>
     <div class="text-center py-5">
         <i class="bi bi-clock-history" style="font-size:3rem; color:#333;"></i>
@@ -675,9 +933,9 @@ async function deleteWorkout(id) {
 
     <?php if ($total_pages > 1): ?>
     <div class="d-flex justify-content-between align-items-center mt-4">
-        <?php if ($page > 1): ?><a href="?page=<?= $page-1 ?>" class="btn btn-forge-outline btn-sm px-4">← NEWER</a><?php else: ?><span></span><?php endif; ?>
+        <?php if ($page > 1): ?><a href="?page=<?= $page-1 ?><?= $cycle_query ?>#workout-list" class="btn btn-forge-outline btn-sm px-4">← NEWER</a><?php else: ?><span></span><?php endif; ?>
         <span class="text-muted x-small"><?= $page ?> / <?= $total_pages ?></span>
-        <?php if ($page < $total_pages): ?><a href="?page=<?= $page+1 ?>" class="btn btn-forge-outline btn-sm px-4">OLDER →</a><?php endif; ?>
+        <?php if ($page < $total_pages): ?><a href="?page=<?= $page+1 ?><?= $cycle_query ?>#workout-list" class="btn btn-forge-outline btn-sm px-4">OLDER →</a><?php endif; ?>
     </div>
     <?php endif; ?>
 
@@ -696,8 +954,10 @@ Chart.defaults.plugins.tooltip.borderWidth = 1;
 Chart.defaults.plugins.tooltip.titleColor = '#e0e0e0';
 Chart.defaults.plugins.tooltip.bodyColor = '#e0e0e0';
 
+const HISTORY_CYCLE_CONTEXT = <?= json_encode($selected_cycle ? (string)$selected_cycle['id'] : 'all') ?>;
 async function papi(action) {
     const fd = new FormData(); fd.append('action', action);
+    fd.append('cycle_context', HISTORY_CYCLE_CONTEXT);
     return fetch('/forge/core/progress_api.php', { method: 'POST', body: fd }).then(r => r.json());
 }
 
@@ -740,19 +1000,42 @@ function renderCalendar(data) {
     const container = canvas.parentElement;
     const availWidth = container.clientWidth - 24; // subtract padding
 
-    // 90 days, aligned to Monday
-    const today = new Date();
-    const start = new Date(today);
-    start.setDate(today.getDate() - 89);
+    if (!data.length) return;
+    // Show the selected period in full. Long ranges collapse to one cell per
+    // week, retaining the useful frequency signal without a five-year strip.
+    const dates = data.map(d => new Date(d.date + 'T00:00:00')).sort((a, b) => a - b);
+    const spanDays = (dates[dates.length - 1] - dates[0]) / 86400000;
+    const monthlyMode = spanDays > 730;
+    const weeklyMode = !monthlyMode && spanDays > 210;
+    const start = new Date(dates[0]);
+    const end = new Date(dates[dates.length - 1]);
     const dow = (start.getDay() + 6) % 7;
     start.setDate(start.getDate() - dow);
-
-    const totalDays = Math.ceil((today - start) / 86400000) + 1;
-    const COLS = Math.ceil(totalDays / 7);
-    const ROWS = 7, ML = 14, MH = 16;
+    if (monthlyMode) {
+        const monthlyCounts = {};
+        data.forEach(({date, count}) => {
+            const key = date.slice(0, 7);
+            monthlyCounts[key] = (monthlyCounts[key] || 0) + parseInt(count || 0);
+        });
+        Object.keys(counts).forEach(k => delete counts[k]); Object.assign(counts, monthlyCounts);
+        start.setDate(1); end.setDate(1);
+    } else if (weeklyMode) {
+        const weeklyCounts = {};
+        data.forEach(({date, count}) => {
+            const d = new Date(date + 'T00:00:00');
+            d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+            const key = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+            weeklyCounts[key] = (weeklyCounts[key] || 0) + parseInt(count || 0);
+        });
+        Object.keys(counts).forEach(k => delete counts[k]); Object.assign(counts, weeklyCounts);
+    }
+    const totalDays = Math.ceil((end - start) / 86400000) + 1;
+    const monthCount = (end.getFullYear() - start.getFullYear()) * 12 + end.getMonth() - start.getMonth() + 1;
+    const COLS = monthlyMode ? 12 : Math.ceil(totalDays / 7);
+    const ROWS = monthlyMode ? Math.ceil(monthCount / 12) : (weeklyMode ? 1 : 7), ML = (weeklyMode || monthlyMode) ? 0 : 14, MH = 16;
 
     // Fit cell size to container width
-    const CELL = Math.max(10, Math.floor((availWidth - ML) / COLS) - 2);
+    const CELL = Math.max(weeklyMode ? 3 : 10, Math.floor((availWidth - ML) / COLS) - 2);
     const GAP  = Math.min(3, Math.floor(CELL * 0.15));
 
     canvas.width  = ML + COLS * (CELL + GAP);
@@ -773,15 +1056,16 @@ function renderCalendar(data) {
     for (let col = 0; col < COLS; col++) {
         for (let row = 0; row < ROWS; row++) {
             const d = new Date(start);
-            d.setDate(start.getDate() + col * 7 + row);
-            if (d > today) continue;
+            if (monthlyMode) d.setMonth(start.getMonth() + row * 12 + col);
+            else d.setDate(start.getDate() + col * 7 + (weeklyMode ? 0 : row));
+            if (d > end) continue;
 
             if (row === 0) {
                 const mk = d.getFullYear() + '-' + d.getMonth();
                 if (!monthCols[mk]) monthCols[mk] = { col, month: d.getMonth() };
             }
 
-            const key   = localDateKey(d);
+            const key   = monthlyMode ? d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') : localDateKey(d);
             const count = counts[key] || 0;
             const alpha = count === 0 ? 0 : 0.2 + 0.8 * (count / maxCount);
             ctx.fillStyle = count === 0 ? '#1e1e1e' : `rgba(255,87,34,${alpha.toFixed(2)})`;
@@ -801,7 +1085,7 @@ function renderCalendar(data) {
 
     ctx.fillStyle = '#555';
     ctx.font = '9px Inter, sans-serif';
-    ['M','','W','','F','',''].forEach((lbl, row) => {
+    ((weeklyMode || monthlyMode) ? [] : ['M','','W','','F','','']).forEach((lbl, row) => {
         if (lbl) ctx.fillText(lbl, 0, MH + row * (CELL + GAP) + CELL - 2);
     });
 }

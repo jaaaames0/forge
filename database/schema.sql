@@ -1,5 +1,10 @@
 -- FORGE Database Schema
 
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version    INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS exercises (
     id              INTEGER PRIMARY KEY,
     name            TEXT    NOT NULL UNIQUE,
@@ -21,7 +26,30 @@ CREATE TABLE IF NOT EXISTS workouts (
     notes       TEXT,
     bodyweight_kg REAL,
     type        TEXT DEFAULT 'strength', -- 'strength' | 'cardio'
-    ab_variant  TEXT DEFAULT NULL        -- 'A' or 'B'; set on exercise seed, written to templates on finish
+    ab_variant  TEXT DEFAULT NULL,       -- 'A' or 'B'; set on exercise seed, written to templates on finish
+    era_id      INTEGER DEFAULT NULL REFERENCES training_eras(id)
+);
+
+CREATE TABLE IF NOT EXISTS training_eras (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    starts_at   TEXT NOT NULL,
+    ends_at     TEXT DEFAULT NULL,
+    is_active   INTEGER NOT NULL DEFAULT 0,
+    source      TEXT NOT NULL DEFAULT 'forge',
+    notes       TEXT DEFAULT NULL
+);
+
+CREATE TABLE IF NOT EXISTS training_cycles (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    era_id      INTEGER NOT NULL REFERENCES training_eras(id) ON DELETE CASCADE,
+    cycle_type  TEXT NOT NULL, -- 'bulk', 'cut', 'recomposition', 'detraining', 'unknown'
+    starts_at   TEXT NOT NULL,
+    ends_at     TEXT NOT NULL,
+    label       TEXT DEFAULT NULL,
+    source      TEXT NOT NULL DEFAULT 'auto', -- 'auto' | 'manual'
+    confidence  REAL DEFAULT NULL,
+    metrics_json TEXT DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS workout_sets (
@@ -109,7 +137,18 @@ CREATE TABLE IF NOT EXISTS body_measurements (
     waist_cm        REAL,
     neck_cm         REAL,
     hip_cm          REAL,
-    caliper_bf_pct  REAL    -- user-entered BF% from skinfold calipers
+    caliper_bf_pct  REAL,   -- user-entered BF% from skinfold calipers
+    era_id          INTEGER DEFAULT NULL REFERENCES training_eras(id),
+    source          TEXT DEFAULT 'manual'
+);
+
+CREATE TABLE IF NOT EXISTS bodyweight_measurements (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    measured_at TEXT NOT NULL,
+    weight_kg   REAL NOT NULL,
+    era_id      INTEGER DEFAULT NULL REFERENCES training_eras(id),
+    workout_id  INTEGER DEFAULT NULL REFERENCES workouts(id) ON DELETE SET NULL,
+    source      TEXT DEFAULT 'workout'
 );
 
 CREATE TABLE IF NOT EXISTS hr_measurements (
@@ -126,6 +165,13 @@ CREATE TABLE IF NOT EXISTS workout_hr_samples (
     bpm         INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_whr_workout ON workout_hr_samples(workout_id, sampled_at);
+CREATE INDEX IF NOT EXISTS idx_workout_sets_workout ON workout_sets(workout_id);
+CREATE INDEX IF NOT EXISTS idx_workout_sets_exercise_workout ON workout_sets(exercise_id, workout_id);
+CREATE INDEX IF NOT EXISTS idx_workouts_finished_started ON workouts(finished_at, started_at);
+CREATE INDEX IF NOT EXISTS idx_workouts_era_finished ON workouts(era_id, finished_at, started_at);
+CREATE INDEX IF NOT EXISTS idx_training_cycles_era_dates ON training_cycles(era_id, starts_at, ends_at);
+CREATE INDEX IF NOT EXISTS idx_personal_records_exercise_1rm ON personal_records(exercise_id, estimated_1rm DESC);
+CREATE INDEX IF NOT EXISTS idx_cardio_records_exercise_type_value ON cardio_records(exercise_id, record_type, value DESC);
 
 -- Default settings
 INSERT OR IGNORE INTO user_settings (key, value) VALUES ('unit', 'kg');

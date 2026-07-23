@@ -243,8 +243,65 @@ body { background-color: #121212; color: #e0e0e0; font-family: 'Inter', sans-ser
 .stat-value { font-size: 1.4rem; font-weight: 900; color: #fff; line-height: 1; font-family: monospace; }
 .stat-unit  { font-size: 0.75rem; color: #888; margin-left: 2px; }
 
+/* Cycle analysis — one card structure shared by desktop and mobile. */
+.cycle-card { border-left-width: 3px; }
+.cycle-card[open] { box-shadow: 0 0 0 1px #4a4a4a; }
+.cycle-card-summary { cursor: pointer; list-style: none; }
+.cycle-card-summary::-webkit-details-marker { display: none; }
+.cycle-card-summary::marker { display: none; }
+.cycle-summary-meta { font-size: 0.72rem; color: #888; }
+.cycle-summary-stats { font-size: 0.7rem; color: #888; }
+.cycle-summary-stats strong { color: #e0e0e0; font-weight: 700; }
+.cycle-compare-toggle {
+    min-height: 32px;
+    min-width: 32px;
+    padding: 2px 9px;
+    font-size: 1rem;
+    line-height: 1;
+}
+.cycle-card-selected { box-shadow: 0 0 0 1px rgba(255, 87, 34, 0.45); }
+.cycle-detail-grid { border-top: 1px solid #333; }
+.cycle-detail-section + .cycle-detail-section { border-top: 1px solid #2a2a2a; }
+.cycle-detail-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 7px 0;
+    border-top: 1px solid #282828;
+    font-size: 0.76rem;
+}
+.cycle-detail-row:first-of-type { border-top: 0; }
+.cycle-detail-value { color: #e0e0e0; text-align: right; white-space: nowrap; }
+.cycle-comparison { overflow-x: auto; }
+.cycle-comparison table { min-width: 620px; }
+.cycle-comparison th:first-child,
+.cycle-comparison td:first-child { position: sticky; left: 0; background: #1e1e1e; z-index: 1; }
+@media (min-width: 768px) {
+    .cycle-detail-section + .cycle-detail-section { border-top: 0; border-left: 1px solid #2a2a2a; }
+}
+
 /* Chart containers */
 .chart-container { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 1rem; }
+
+/* Shared segmented navigation/control used across progress and history. */
+.seg-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    color: #888;
+    font-size: 0.75rem;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 9px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    min-height: 44px;
+}
+.seg-btn.active { background: #FF5722; color: #fff; }
 
 /* -------------------------------------------------------
    Exercise cards / list items
@@ -275,4 +332,5 @@ body { background-color: #121212; color: #e0e0e0; font-family: 'Inter', sans-ser
     /* Ensure content doesn't hide behind the site-wide active workout bar */
     body.workout-bar-active { padding-bottom: 70px; }
     body.workout-bar-active.workout-bar-timer { padding-bottom: 80px; }
+    .seg-btn { font-size: 0.72rem; padding: 8px 10px; }
 }

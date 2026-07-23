@@ -9,17 +9,35 @@ header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
 
 // Load key from gitignored credentials file, fallback to env var
-$_creds_file = __DIR__ . '/credentials.env';
+$_creds_file = '/srv/secrets/forge_credentials.env';
 $ACCESS_KEY  = file_exists($_creds_file)
     ? trim(file_get_contents($_creds_file))
     : (getenv('FORGE_ACCESS_KEY') ?: '');
 
 $AUTH_TOKEN  = hash_hmac('sha256', 'forge_auth_v1', $ACCESS_KEY);
 $COOKIE_NAME = 'forge_auth';
-$COOKIE_TTL  = 365 * 24 * 3600; // 1 year
+$COOKIE_TTL  = 90 * 24 * 3600;
+$COOKIE_OPTIONS = [
+    'expires'  => time() + $COOKIE_TTL,
+    'path'     => '/forge/',
+    'secure'    => true,
+    'httponly'  => true,
+    'samesite'  => 'Strict',
+];
+
+if ($ACCESS_KEY === '') {
+    http_response_code(503);
+    exit('FORGE access key is not configured.');
+}
 
 if (isset($_GET['logout'])) {
-    setcookie($COOKIE_NAME, '', time() - 3600, '/', '', false, true);
+    setcookie($COOKIE_NAME, '', [
+        'expires'  => time() - 3600,
+        'path'     => '/forge/',
+        'secure'    => true,
+        'httponly'  => true,
+        'samesite'  => 'Strict',
+    ]);
     header("Location: /forge/");
     exit;
 }
@@ -27,8 +45,8 @@ if (isset($_GET['logout'])) {
 $authenticated = isset($_COOKIE[$COOKIE_NAME]) && hash_equals($AUTH_TOKEN, $_COOKIE[$COOKIE_NAME]);
 
 if (!$authenticated) {
-    if (isset($_POST['access_key']) && $_POST['access_key'] === $ACCESS_KEY) {
-        setcookie($COOKIE_NAME, $AUTH_TOKEN, time() + $COOKIE_TTL, '/', '', false, true);
+    if (isset($_POST['access_key']) && hash_equals($ACCESS_KEY, (string)$_POST['access_key'])) {
+        setcookie($COOKIE_NAME, $AUTH_TOKEN, $COOKIE_OPTIONS);
         header("Location: " . $_SERVER['PHP_SELF']);
         exit;
     }

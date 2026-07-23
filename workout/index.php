@@ -3,6 +3,8 @@ require_once __DIR__ . '/../core/auth.php';
 require_once __DIR__ . '/../core/db_helper.php';
 
 $db          = get_db_connection();
+$stale_workouts = cleanup_stale_active_workouts($db);
+$active_era_id = active_training_era_id($db);
 $unit        = 'kg';
 $rest_default = 90;
 
@@ -60,8 +62,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'start
                 $ex_row->execute([$exercise_id]);
                 $ex_name = $ex_row->fetchColumn();
                 if ($ex_name) {
-                    $db->prepare("INSERT INTO workouts (name, type, started_at) VALUES (?, 'cardio', ?)")
-                       ->execute([$ex_name, date('Y-m-d H:i:s')]);
+                    $db->prepare("INSERT INTO workouts (name, type, started_at, era_id) VALUES (?, 'cardio', ?, ?)")
+                       ->execute([$ex_name, date('Y-m-d H:i:s'), active_training_era_id($db)]);
                     $wid = (int)$db->lastInsertId();
                     $db->prepare("INSERT INTO workout_exercises (workout_id, exercise_id, order_num, target_sets) VALUES (?, ?, 0, 1)")
                        ->execute([$wid, $exercise_id]);
@@ -75,7 +77,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'start
                 $stmt->execute([$template_id]);
                 $name = $stmt->fetchColumn() ?: null;
             }
-            $db->prepare("INSERT INTO workouts (name, template_id, started_at) VALUES (?, ?, ?)")->execute([$name, $template_id, date('Y-m-d H:i:s')]);
+            $db->prepare("INSERT INTO workouts (name, template_id, started_at, era_id) VALUES (?, ?, ?, ?)")
+               ->execute([$name, $template_id, date('Y-m-d H:i:s'), active_training_era_id($db)]);
         }
     }
     header("Location: /forge/workout/");
@@ -84,6 +87,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'start
 
 // Load active (in-progress) workout
 $active = $db->query("SELECT * FROM workouts WHERE finished_at IS NULL ORDER BY started_at DESC LIMIT 1")->fetch(PDO::FETCH_ASSOC);
+$resume_idle_seconds = $active ? max(0, time() - strtotime(workout_last_activity_at($db, (int)$active['id'], $active['started_at']))) : 0;
 
 $exercises         = []; // keyed by exercise_id
 $templates         = [];
@@ -112,6 +116,7 @@ if ($active) {
             'rest_category'  => $row['rest_category'],
             'sets'           => [],
             'prev'           => [],
+            'prev_drops'     => [],
             'target_sets'    => (int)($row['target_sets'] ?? 3),
             'progression_applied_weight' => $row['progression_applied_weight'] !== null ? (float)$row['progression_applied_weight'] : null,
         ];
@@ -218,26 +223,29 @@ if ($active) {
         }
     }
 
-    // Fetch previous-session sets for each exercise (for the PREV column).
+        // Fetch previous-session sets for each exercise (for the PREV column).
     // Constrained to the single most recent finished workout that included this exercise,
     // so set N always maps to set N from that session — no cross-session bleed.
     foreach (array_keys($exercises) as $eid) {
         $stmt = $db->prepare("
-            SELECT ws.set_number, ws.weight_kg, ws.added_weight_kg, ws.reps, ws.rpe,
+            SELECT ws.set_number, ws.set_type, ws.weight_kg, ws.added_weight_kg, ws.reps, ws.rpe,
                    ws.duration_sec, ws.distance_km
             FROM workout_sets ws
             WHERE ws.exercise_id = ?
-              AND ws.set_type = 'working'
+              AND ws.set_type IN ('working', 'dropset')
               AND ws.workout_id = (
                   SELECT w2.id FROM workouts w2
                   JOIN workout_sets ws2 ON ws2.workout_id = w2.id
                   WHERE ws2.exercise_id = ? AND w2.finished_at IS NOT NULL AND w2.id != ?
+                    AND w2.era_id = ?
                   ORDER BY w2.finished_at DESC LIMIT 1
               )
             ORDER BY ws.set_number ASC
         ");
-        $stmt->execute([$eid, $eid, $active['id']]);
-        $exercises[$eid]['prev'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        $stmt->execute([$eid, $eid, $active['id'], $active_era_id]);
+        $previous_sets = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        $exercises[$eid]['prev'] = array_values(array_filter($previous_sets, fn($set) => $set['set_type'] === 'working'));
+        $exercises[$eid]['prev_drops'] = array_values(array_filter($previous_sets, fn($set) => $set['set_type'] === 'dropset'));
 
         // Progression suggestion: compute whenever a scheme exists, so the hint
         // survives partial-logging reloads. Display rules (handled at render time):
@@ -490,6 +498,11 @@ $page_context = 'workout';
      ========================================================= -->
 
 <!-- Workout header bar -->
+<?php if ($resume_idle_seconds >= 900): ?>
+<div class="px-3 py-2" style="background:#211713;border-bottom:1px solid #6d4c41;font-size:0.74rem;color:#e0e0e0;">
+    <strong style="color:#ffab91;">RESUMED WORKOUT</strong> · Last activity <?= (int)floor($resume_idle_seconds / 60) ?> min ago. Continue, or finish/discard from the controls below.
+</div>
+<?php endif; ?>
 <div class="sticky-top" style="background:#0d0d0d; border-bottom:1px solid #222; padding:10px 12px; z-index:900;">
     <div class="d-flex align-items-center gap-2">
         <div class="flex-grow-1 min-w-0">
@@ -606,6 +619,9 @@ $page_context = 'workout';
                         <button class="btn-icon" onclick="moveExercise(<?= $eid ?>, 'down')" type="button" aria-label="Move down">
                             <i class="bi bi-chevron-down" style="font-size:0.9rem; color:#555;"></i>
                         </button>
+                        <button class="btn-icon" onclick="openReplaceExercise(<?= $eid ?>)" type="button" aria-label="Replace exercise" title="Replace exercise">
+                            <i class="bi bi-arrow-left-right" style="font-size:0.85rem; color:#888;"></i>
+                        </button>
                         <button class="btn-icon" onclick="removeExercise(<?= $eid ?>)" type="button" aria-label="Remove exercise">
                             <i class="bi bi-x-lg" style="font-size:1rem; color:#555;"></i>
                         </button>
@@ -634,6 +650,8 @@ $page_context = 'workout';
                     <i class="bi bi-info-circle me-1"></i><?= htmlspecialchars($ex['suggestion']['message']) ?>
                 </div>
                 <?php endif; ?>
+
+                <div class="exercise-complete-panel d-none mb-2" aria-live="polite"></div>
 
                 <div style="overflow:hidden;">
                 <table class="set-table" style="table-layout:fixed; width:100%;">
@@ -986,6 +1004,7 @@ $page_context = 'workout';
     </div>
 </div>
 
+<script src="/forge/workout/warmups.js?v=1"></script>
 <?php if ($active && ($active['type'] ?? 'strength') === 'strength'): ?>
 <script>
 const WORKOUT_ID    = <?= (int)$active['id'] ?>;
@@ -1007,18 +1026,14 @@ const prevSetsMap = {
     <?= $eid ?>: <?= json_encode($ex['prev']) ?>,
 <?php endforeach; ?>
 };
+const prevDropSetsMap = {
+<?php foreach ($exercises as $eid => $ex): ?>
+    <?= $eid ?>: <?= json_encode($ex['prev_drops']) ?>,
+<?php endforeach; ?>
+};
 
-// -------------------------------------------------------
-// API helper
-// -------------------------------------------------------
 async function api(action, data = {}) {
-    const fd = new FormData();
-    fd.append('action', action);
-    for (const [k, v] of Object.entries(data)) {
-        if (v !== null && v !== undefined) fd.append(k, v);
-    }
-    const r = await fetch('/forge/core/api.php', { method: 'POST', body: fd });
-    return r.json();
+    return window.forgeApi(action, data);
 }
 
 function syncExerciseTargetSets(block) {
@@ -1036,22 +1051,29 @@ function syncExerciseTargetSets(block) {
     updateBarNextUp();
 }
 
-// -------------------------------------------------------
-// Workout duration timer
-// -------------------------------------------------------
-const workoutStartMs = <?= strtotime($active['started_at']) ?> * 1000;
-function updateDuration() {
-    const elapsed = Math.max(0, Math.floor((Date.now() - workoutStartMs) / 1000));
-    const h = Math.floor(elapsed / 3600);
-    const m = Math.floor((elapsed % 3600) / 60);
-    const s = elapsed % 60;
-    const display = (h ? h + ':' : '') +
-        String(m).padStart(h ? 2 : 1, '0') + ':' +
-        String(s).padStart(2, '0');
-    document.getElementById('workout-duration').textContent = display;
+async function showExerciseCompletion(block) {
+    const panel = block.querySelector('.exercise-complete-panel');
+    if (!panel || panel.dataset.loaded === '1') return;
+    const exerciseId = parseInt(block.dataset.exerciseId || '0', 10);
+    const progressionHint = block.querySelector('.progression-hint');
+    if (progressionHint) progressionHint.style.display = 'none';
+    panel.classList.remove('d-none');
+    panel.style.cssText = 'background:#1e1e1e;border-left:3px solid #555;padding:8px 10px;border-radius:0 4px 4px 0;';
+    panel.innerHTML = '<div class="stat-label">EXERCISE COMPLETE</div><div style="font-size:.78rem;color:#e0e0e0;">Calculating your next target…</div>';
+    const result = await api('get_exercise_completion', { workout_id: WORKOUT_ID, exercise_id: exerciseId });
+    if (result.status !== 'success') {
+        panel.innerHTML = '<div class="stat-label">EXERCISE COMPLETE</div><div style="font-size:.78rem;color:#e0e0e0;">Working sets logged — finish the workout to lock in your next target.</div>';
+        return;
+    }
+    const data = result.data || {};
+    const progress = data.tone === 'progress';
+    panel.dataset.loaded = '1';
+    panel.classList.remove('d-none');
+    panel.style.cssText = `background:#1e1e1e;border-left:3px solid ${progress ? '#81c784' : '#555'};padding:8px 10px;border-radius:0 4px 4px 0;`;
+    panel.innerHTML = `<div class="stat-label" style="color:${progress ? '#81c784' : '#888'};">EXERCISE COMPLETE</div><div style="font-size:.78rem;color:#e0e0e0;">${data.message || 'Working sets logged.'}</div>`;
 }
-setInterval(updateDuration, 1000);
-updateDuration();
+
+window.forgeWorkoutClockConfig = { startedMs: <?= strtotime($active['started_at']) ?> * 1000 };
 
 // Save workout name on blur
 document.getElementById('workout-name-input').addEventListener('change', function () {
@@ -1164,6 +1186,14 @@ async function tickSet(btn) {
     // Un-tick: re-enable editing
     if (row.classList.contains('ticked')) {
         row.classList.remove('ticked');
+        const completionPanel = block.querySelector('.exercise-complete-panel');
+        if (completionPanel) {
+            completionPanel.classList.add('d-none');
+            completionPanel.dataset.loaded = '';
+            completionPanel.innerHTML = '';
+        }
+        const progressionHint = block.querySelector('.progression-hint');
+        if (progressionHint) progressionHint.style.display = '';
         const prCellUntick = row.querySelector('.pr-cell');
         if (prCellUntick) prCellUntick.innerHTML = '';
         row.querySelectorAll('input').forEach(i => { i.disabled = false; });
@@ -1269,6 +1299,11 @@ async function tickSet(btn) {
     }
 
     updateBarNextUp();
+    if (exType !== 'cardio' && setType === 'working') {
+        const target = parseInt(block.dataset.targetSets || '0', 10);
+        const done = block.querySelectorAll('.set-row.ticked[data-set-type="working"]').length;
+        if (target > 0 && done >= target) showExerciseCompletion(block);
+    }
 }
 
 // Returns true only when every exercise block has met its working-set target.
@@ -1518,11 +1553,16 @@ function addDropSet(exerciseId) {
     const tbody  = block.querySelector('.set-tbody');
     const setNum = tbody.querySelectorAll('tr').length + 1;
 
-    // Suggest 75% of the last ticked working set's weight, rounded to nearest 2.5kg
+    // Reuse the matching drop set from the previous session when there is one.
+    // Otherwise retain the 75%-of-last-working-set fallback for first-time drops.
+    const dropIndex = block.querySelectorAll('.set-row[data-set-type="dropset"]').length;
+    const previousDrop = (prevDropSetsMap[exerciseId] || [])[dropIndex] || null;
     const tickedWorking = [...block.querySelectorAll('.set-row.ticked[data-set-type="working"]')];
     const lastWorking   = tickedWorking[tickedWorking.length - 1];
-    let suggestedWeight = '';
-    if (lastWorking) {
+    let suggestedWeight = previousDrop
+        ? (exType === 'bodyweight' ? previousDrop.added_weight_kg : previousDrop.weight_kg)
+        : '';
+    if (!previousDrop && lastWorking) {
         const wInput = lastWorking.querySelector('.weight-input');
         const lastW  = wInput ? parseFloat(wInput.value) : NaN;
         if (!isNaN(lastW) && lastW > 0) {
@@ -1539,20 +1579,25 @@ function addDropSet(exerciseId) {
     const numCell = `<td class="set-num-cell"><span class="set-num" style="font-weight:900;font-size:.9rem;color:#ce93d8;">${setNum}</span></td>`;
     const prCell  = `<td class="pr-cell"></td>`;
     const tick    = `<td><button class="btn-tick btn-icon" onclick="tickSet(this)" type="button" aria-label="Log set"><i class="bi bi-circle" style="font-size:1.4rem;color:#444;"></i></button></td>`;
+    const previousLabel = previousDrop
+        ? `DROP · ${suggestedWeight || 0} × ${previousDrop.reps || '—'}`
+        : 'DROP';
+    const previousReps = previousDrop?.reps ?? '';
+    const previousRpe = previousDrop?.rpe ?? '';
 
     if (exType === 'bodyweight') {
         row.innerHTML = numCell
-            + `<td style="font-size:.78rem;color:#888;white-space:nowrap;">DROP</td>`
+            + `<td style="font-size:.78rem;color:#888;white-space:nowrap;">${previousLabel}</td>`
             + `<td><input type="number" class="input-set weight-input" inputmode="decimal" placeholder="0" value="${suggestedWeight}" step="0.5" min="0"></td>`
-            + `<td><input type="number" class="input-set reps-input"   inputmode="numeric" placeholder="—" min="1" max="999"></td>`
-            + `<td><input type="number" class="input-set rpe-input"    inputmode="decimal" placeholder="—" step="0.5" min="6" max="10"></td>`
+            + `<td><input type="number" class="input-set reps-input"   inputmode="numeric" placeholder="—" min="1" max="999" value="${previousReps}"></td>`
+            + `<td><input type="number" class="input-set rpe-input"    inputmode="decimal" placeholder="—" step="0.5" min="6" max="10" value="${previousRpe}"></td>`
             + prCell + tick;
     } else {
         row.innerHTML = numCell
-            + `<td style="font-size:.78rem;color:#888;white-space:nowrap;">DROP</td>`
+            + `<td style="font-size:.78rem;color:#888;white-space:nowrap;">${previousLabel}</td>`
             + `<td><input type="number" class="input-set weight-input" inputmode="decimal" placeholder="—" value="${suggestedWeight}" step="0.5" min="0"></td>`
-            + `<td><input type="number" class="input-set reps-input"   inputmode="numeric" placeholder="—" min="1" max="999"></td>`
-            + `<td><input type="number" class="input-set rpe-input"    inputmode="decimal" placeholder="—" step="0.5" min="6" max="10"></td>`
+            + `<td><input type="number" class="input-set reps-input"   inputmode="numeric" placeholder="—" min="1" max="999" value="${previousReps}"></td>`
+            + `<td><input type="number" class="input-set rpe-input"    inputmode="decimal" placeholder="—" step="0.5" min="6" max="10" value="${previousRpe}"></td>`
             + prCell + tick;
     }
 
@@ -1575,110 +1620,6 @@ async function deleteLastSet(exerciseId) {
     }
     const last = rows[rows.length - 1];
     await deleteSetRow(last);
-}
-
-// -------------------------------------------------------
-// Warmup calculator
-// -------------------------------------------------------
-function floorTo2_5(v) { return Math.floor(v / 2.5) * 2.5; }
-
-// Warmup presets: stored in user_settings as JSON arrays keyed by rest_category.
-// Each row: { pct: number|null, reps: number }
-// pct=null → empty bar (user fills in weight manually in workout).
-// pct is % of working weight; reps is rep count.
-const WARMUP_KEYS = {
-    'compound_big4': 'compound',
-    'compound':      'compound',
-    'isolation':     'accessory',
-};
-
-function buildWarmupSets(restCategory, working) {
-    const key = WARMUP_KEYS[restCategory] || 'compound';
-    const presets = Array.isArray(window.forgeWarmupPresets?.[key]) ? window.forgeWarmupPresets[key] : null;
-
-    let html = `<div class="stat-label mb-3">WORKING: <span style="font-family:monospace;color:#fff;">${working}kg</span></div>`;
-
-    if (!presets || !presets.length) {
-        html += `<div class="text-muted text-center py-3" style="font-size:.8rem;">No warmup defined in Settings</div>`;
-        return html;
-    }
-
-    presets.forEach((s, i) => {
-        let weightStr = '';
-        if (s.pct == null) {
-            weightStr = '20kg <span style="color:#888;font-size:.8rem;">(bar)</span>';
-        } else if (s.pct != null) {
-            const w = floorTo2_5(working * s.pct / 100);
-            weightStr = `${w}kg <span style="color:#888;font-size:.8rem;">(${s.pct}%)</span>`;
-        } else {
-            weightStr = '—';
-        }
-        html += `<div class="d-flex align-items-center justify-content-between py-2" style="border-bottom:1px solid #2a2a2a;">
-            <div>
-                <span class="stat-label">SET ${i + 1}</span>
-            </div>
-            <div style="font-family:monospace;font-weight:900;font-size:1rem;color:#e0e0e0;">
-                ${weightStr} <span style="color:#888;font-size:.85rem;">× ${s.reps}</span>
-            </div>
-        </div>`;
-    });
-    return html;
-}
-
-function openWarmupCalc(exerciseId) {
-    const block      = document.querySelector(`.exercise-block[data-exercise-id="${exerciseId}"]`);
-    const restCat    = block.dataset.restCategory || 'compound';
-
-    // Find working weight: first working-set weight input with a value
-    let working = null;
-    for (const row of block.querySelectorAll('.set-row[data-set-type="working"]')) {
-        const w = row.querySelector('.weight-input');
-        if (w && w.value !== '') { working = parseFloat(w.value); break; }
-    }
-
-    const body = document.getElementById('warmup-modal-body');
-    if (working && working > 0) {
-        body.innerHTML = buildWarmupSets(restCat, working)
-            + `<div class="mt-3 d-flex gap-2 align-items-center">
-                <input type="number" id="warmup-override" class="form-control" inputmode="decimal"
-                       placeholder="Different weight?" style="max-width:160px;" value="${working}">
-                <button class="btn btn-forge" style="font-size:.8rem;" onclick="recalcWarmup(${exerciseId})">RECALC</button>
-               </div>`;
-    } else {
-        body.innerHTML = `<p class="text-muted" style="font-size:.82rem;">Enter your working weight:</p>
-            <div class="d-flex gap-2 align-items-center">
-                <input type="number" id="warmup-override" class="form-control" inputmode="decimal" placeholder="e.g. 100" style="max-width:160px;">
-                <button class="btn btn-forge" style="font-size:.8rem;" onclick="recalcWarmup(${exerciseId})">CALC</button>
-            </div>
-            <div id="warmup-sets-out" class="mt-3"></div>`;
-    }
-
-    const modal = bootstrap.Modal.getOrCreateInstance(document.getElementById('warmupModal'));
-    modal.show();
-}
-
-function recalcWarmup(exerciseId) {
-    const block   = document.querySelector(`.exercise-block[data-exercise-id="${exerciseId}"]`);
-    const restCat = block.dataset.restCategory || 'compound';
-    const inp     = document.getElementById('warmup-override');
-    const working = parseFloat(inp.value);
-    if (isNaN(working) || working <= 0) { inp.style.borderColor = '#ff4444'; return; }
-    inp.style.borderColor = '';
-
-    const out = document.getElementById('warmup-sets-out');
-    if (out) {
-        // Inline recalc (no-working-weight path)
-        out.innerHTML = buildWarmupSets(restCat, working);
-    } else {
-        // Replace full body (had-working-weight path)
-        document.getElementById('warmup-modal-body').innerHTML =
-            buildWarmupSets(restCat, working)
-            + `<div class="mt-3 d-flex gap-2 align-items-center">
-                <input type="number" id="warmup-override" class="form-control" inputmode="decimal"
-                       placeholder="Different weight?" style="max-width:160px;" value="${working}">
-                <button class="btn btn-forge" style="font-size:.8rem;" onclick="recalcWarmup(${exerciseId})">RECALC</button>
-               </div>`;
-    }
 }
 
 async function deleteSetRow(row) {
@@ -1754,6 +1695,20 @@ function removeExercise(exerciseId) {
     }
 }
 
+let replaceExerciseId = null;
+function openReplaceExercise(exerciseId) {
+    const block = document.querySelector(`.exercise-block[data-exercise-id="${exerciseId}"]`);
+    if (!block) return;
+    if (block.querySelector('.set-row.ticked')) {
+        alert('Only an unstarted exercise can be replaced. Add the alternative separately if you have already logged sets.');
+        return;
+    }
+    replaceExerciseId = exerciseId;
+    document.getElementById('exercise-search').placeholder = 'Search replacement…';
+    loadExerciseList().then(() => renderExerciseList(allExercises));
+    new bootstrap.Modal(document.getElementById('addExerciseModal')).show();
+}
+
 // -------------------------------------------------------
 // Add Exercise modal
 // -------------------------------------------------------
@@ -1824,6 +1779,20 @@ function filterExercises(query) {
 }
 
 function selectExercise(ex) {
+    if (replaceExerciseId !== null) {
+        const fromId = replaceExerciseId;
+        replaceExerciseId = null;
+        const existing = document.querySelector(`.exercise-block[data-exercise-id="${ex.id}"]`);
+        if (existing) { alert('That exercise is already in this workout.'); return; }
+        const oldBlock = document.querySelector(`.exercise-block[data-exercise-id="${fromId}"]`);
+        bootstrap.Modal.getInstance(document.getElementById('addExerciseModal')).hide();
+        api('replace_workout_exercise', { workout_id: WORKOUT_ID, from_exercise_id: fromId, to_exercise_id: ex.id }).then(result => {
+            if (result.status !== 'success') { alert('Error: ' + result.message); return; }
+            if (oldBlock) oldBlock.remove();
+            addExerciseBlock(ex);
+        });
+        return;
+    }
     // If already in workout, scroll to it
     const existing = document.querySelector(`.exercise-block[data-exercise-id="${ex.id}"]`);
     if (existing) {
@@ -1876,7 +1845,7 @@ function addExerciseBlock(ex) {
                         ${muscleBadge}${bwHint}
                     </div>
                     <div class="d-flex align-items-center">
-                        ${exType !== 'cardio' && ex.rest_category !== 'bodyweight' && window.forgeWarmupPresets?.[WARMUP_KEYS[ex.rest_category || '']] ? `<button class="btn-icon" onclick="openWarmupCalc(${ex.id})" type="button" title="Warmup calculator">
+                        ${exType !== 'cardio' && ex.rest_category !== 'bodyweight' && window.forgeWarmupPresets?.[window.forgeWarmupKeys?.[ex.rest_category || '']] ? `<button class="btn-icon" onclick="openWarmupCalc(${ex.id})" type="button" title="Warmup calculator">
                             <i class="bi bi-thermometer-half" style="font-size:1rem;color:#555;"></i>
                         </button>` : ''}
                         <button class="btn-icon" onclick="moveExercise(${ex.id}, 'up')" type="button" aria-label="Move up">
@@ -1885,11 +1854,15 @@ function addExerciseBlock(ex) {
                         <button class="btn-icon" onclick="moveExercise(${ex.id}, 'down')" type="button" aria-label="Move down">
                             <i class="bi bi-chevron-down" style="font-size:0.9rem;color:#555;"></i>
                         </button>
+                        <button class="btn-icon" onclick="openReplaceExercise(${ex.id})" type="button" aria-label="Replace exercise" title="Replace exercise">
+                            <i class="bi bi-arrow-left-right" style="font-size:0.85rem;color:#888;"></i>
+                        </button>
                         <button class="btn-icon" onclick="removeExercise(${ex.id})" type="button">
                             <i class="bi bi-x-lg" style="font-size:1rem;color:#555;"></i>
                         </button>
                     </div>
                 </div>
+                <div class="exercise-complete-panel d-none mb-2" aria-live="polite"></div>
                 <div style="overflow:hidden;">
                 <table class="set-table" style="table-layout:fixed;width:100%;">
                     <colgroup>${colgroup}</colgroup>
@@ -1924,7 +1897,10 @@ function addExerciseBlock(ex) {
 
     api('get_last_exercise_sets', { exercise_id: ex.id, workout_id: WORKOUT_ID })
         .then(r => {
-            if (r.status === 'success') prevSetsMap[ex.id] = r.data || [];
+            if (r.status === 'success') {
+                prevSetsMap[ex.id] = r.data || [];
+                prevDropSetsMap[ex.id] = r.drop_sets || [];
+            }
             addSet(ex.id);
         });
 }
@@ -1933,6 +1909,10 @@ function addExerciseBlock(ex) {
 document.getElementById('addExerciseModal').addEventListener('show.bs.modal', () => {
     document.getElementById('exercise-search').value = '';
     if (exerciseListLoaded) renderExerciseList(allExercises);
+});
+document.getElementById('addExerciseModal').addEventListener('hidden.bs.modal', () => {
+    replaceExerciseId = null;
+    document.getElementById('exercise-search').placeholder = 'Search exercises…';
 });
 
 // -------------------------------------------------------
@@ -1985,477 +1965,21 @@ async function confirmFinish() {
     }
 }
 </script>
+<script src="/forge/workout/session-clock.js?v=1"></script>
 <?php endif; // end strength-only JS ?>
 
 <!-- ── Heart Rate Monitor module (all active workouts) ───────────────────── -->
 <?php if ($active): ?>
-<script>
-window.forgeHR = (function () {
-    const HR_SERVICE   = 0x180D;
-    const HR_CHAR      = 0x2A37;
-    const DEVICE_KEY   = 'forge_hr_device';
-    const WORKOUT_ID   = <?= (int)$active['id'] ?>;
-    const SAMPLE_MS    = 5000;
-    const FLUSH_MS     = 30000;
-    const WATCH_TIMEOUT_MS = 20000; // give watchAdvertisements 20 s before giving up
-
-    // ── DOM refs ──────────────────────────────────────────────────────────────
-    const badge     = document.getElementById('hr-badge');
-    const badgeIcon = document.getElementById('hr-badge-icon');
-    const badgeBpm  = document.getElementById('hr-badge-bpm');
-
-    // ── State ─────────────────────────────────────────────────────────────────
-    let bleDevice      = null;
-    let bleChar        = null;
-    let disconnectBound = false; // prevent stacking gattserverdisconnected listeners
-    let liveBpm        = 0;
-    let sampleTimer    = null;
-    let flushTimer     = null;
-    let watchAbort     = null;   // AbortController for watchAdvertisements
-    let pending        = [];
-    let recentReadings = []; // {bpm, ts} ring buffer for peak BPM detection (~60s)
-    // states: disconnected | known | connecting | watching | connected
-    // 'known'  = stored device name in localStorage but not connected (invite one-tap)
-    let state = 'disconnected';
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
-    function parseHR(value) {
-        const flags = value.getUint8(0);
-        return (flags & 0x01) ? value.getUint16(1, true) : value.getUint8(1);
-    }
-    function now() {
-        return new Date().toISOString().slice(0, 19).replace('T', ' ');
-    }
-    function hasStoredDevice() {
-        return !!localStorage.getItem(DEVICE_KEY);
-    }
-
-    // ── Badge rendering ───────────────────────────────────────────────────────
-    function setState(s) {
-        state = s;
-        renderBadge();
-    }
-
-    function renderBadge() {
-        if (!badge) return;
-        badge.style.display = 'flex';
-        switch (state) {
-            case 'connected':
-                badge.style.borderColor = '#FF5722';
-                badge.title             = 'HR connected — tap to disconnect';
-                badgeIcon.style.color   = '#FF5722';
-                badgeBpm.style.color    = '#FF5722';
-                badgeBpm.textContent    = liveBpm || '--';
-                break;
-            case 'connecting':
-            case 'watching':
-                badge.style.borderColor = '#FFC107';
-                badge.title             = state === 'watching' ? 'Waiting for monitor…' : 'Connecting…';
-                badgeIcon.style.color   = '#FFC107';
-                badgeBpm.style.color    = '#FFC107';
-                badgeBpm.textContent    = '…';
-                break;
-            case 'known':
-                // We know a device — make badge clearly tappable (orange outline, "+" prompt)
-                badge.style.borderColor = '#FF5722';
-                badge.title             = 'Tap to reconnect HR monitor';
-                badgeIcon.style.color   = '#FF5722';
-                badgeBpm.style.color    = '#FF5722';
-                badgeBpm.textContent    = '+';
-                break;
-            default: // disconnected, no stored device
-                badge.style.borderColor = '#333';
-                badge.title             = 'Tap to connect HR monitor';
-                badgeIcon.style.color   = '#444';
-                badgeBpm.style.color    = '#555';
-                badgeBpm.textContent    = '--';
-        }
-    }
-
-    // ── Sampling + flush ──────────────────────────────────────────────────────
-    function startSampling() {
-        stopSampling();
-        sampleTimer = setInterval(() => {
-            if (liveBpm > 0) pending.push({ bpm: liveBpm, sampled_at: now() });
-        }, SAMPLE_MS);
-        flushTimer = setInterval(flushSamples, FLUSH_MS);
-    }
-    function stopSampling() {
-        clearInterval(sampleTimer);
-        clearInterval(flushTimer);
-        sampleTimer = flushTimer = null;
-    }
-    async function flushSamples() {
-        if (!pending.length) return;
-        const batch = pending.splice(0, pending.length);
-        try {
-            const fd = new FormData();
-            fd.append('action', 'log_hr_sample');
-            fd.append('workout_id', WORKOUT_ID);
-            fd.append('samples', JSON.stringify(batch));
-            await fetch('/forge/core/api.php', { method: 'POST', body: fd });
-        } catch (_) {
-            pending.unshift(...batch);
-        }
-    }
-    document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'hidden') flushSamples();
-    });
-    window.addEventListener('pagehide', flushSamples);
-
-    // ── HR notification handler ───────────────────────────────────────────────
-    function onHRNotification(event) {
-        const bpm = parseHR(event.target.value);
-        if (bpm < 20 || bpm > 250) return;
-        liveBpm = bpm;
-        // Ring buffer: keep last ~60 readings (~60s at 1 reading/sec)
-        recentReadings.push({ bpm, ts: Date.now() });
-        if (recentReadings.length > 60) recentReadings.shift();
-        badgeBpm.textContent  = bpm;
-        badgeIcon.style.color = '#FF5722';
-        badgeBpm.style.color  = '#FF5722';
-        // Optional hook for external display updates (e.g. cardio session page)
-        if (typeof window.onForgeHRUpdate === 'function') window.onForgeHRUpdate(bpm);
-    }
-
-    // ── Core connect (given a BluetoothDevice object) ─────────────────────────
-    // Returns true on success, false on failure.
-    async function connectToDevice(device) {
-        try {
-            setState('connecting');
-            const server  = await device.gatt.connect();
-            const service = await server.getPrimaryService(HR_SERVICE);
-            bleChar        = await service.getCharacteristic(HR_CHAR);
-            await bleChar.startNotifications();
-            bleChar.addEventListener('characteristicvaluechanged', onHRNotification);
-
-            bleDevice = device;
-            localStorage.setItem(DEVICE_KEY, device.name || '');
-
-            // Attach disconnect listener exactly once per device object
-            if (!disconnectBound) {
-                device.addEventListener('gattserverdisconnected', onDisconnect);
-                disconnectBound = true;
-            }
-
-            setState('connected');
-            startSampling();
-            return true;
-        } catch (err) {
-            console.warn('FORGE HR: gatt.connect failed —', err.message);
-            return false;
-        }
-    }
-
-    // ── watchAdvertisements-based reconnect ───────────────────────────────────
-    // Use when gatt.connect() fails immediately (device not yet advertising).
-    // Waits up to WATCH_TIMEOUT_MS for the device to broadcast, then connects.
-    function watchAndConnect(device) {
-        if (!device.watchAdvertisements) {
-            // API not available — fall straight to known/disconnected
-            setState(hasStoredDevice() ? 'known' : 'disconnected');
-            return;
-        }
-        setState('watching');
-        watchAbort = new AbortController();
-
-        const timeout = setTimeout(() => {
-            watchAbort.abort();
-            watchAbort = null;
-            setState(hasStoredDevice() ? 'known' : 'disconnected');
-            console.log('FORGE HR: watchAdvertisements timed out');
-        }, WATCH_TIMEOUT_MS);
-
-        device.addEventListener('advertisementreceived', async () => {
-            clearTimeout(timeout);
-            try { watchAbort?.abort(); } catch (_) {}
-            watchAbort = null;
-            const ok = await connectToDevice(device);
-            if (!ok) setState(hasStoredDevice() ? 'known' : 'disconnected');
-        }, { once: true });
-
-        device.watchAdvertisements({ signal: watchAbort.signal })
-            .catch(err => {
-                clearTimeout(timeout);
-                watchAbort = null;
-                console.warn('FORGE HR: watchAdvertisements failed —', err.message);
-                setState(hasStoredDevice() ? 'known' : 'disconnected');
-            });
-    }
-
-    // ── Disconnect handler ────────────────────────────────────────────────────
-    function onDisconnect() {
-        disconnectBound = false;
-        bleChar = null;
-        liveBpm = 0;
-        stopSampling();
-        flushSamples();
-        console.log('FORGE HR: disconnected — attempting watchAdvertisements reconnect');
-        // Same device object is still valid; use watchAdvertisements to wait for it
-        if (bleDevice) {
-            watchAndConnect(bleDevice);
-        } else {
-            setState(hasStoredDevice() ? 'known' : 'disconnected');
-        }
-    }
-
-    // ── Auto-reconnect on page load via getDevices() ──────────────────────────
-    async function autoReconnect() {
-        if (!navigator.bluetooth?.getDevices) {
-            console.log('FORGE HR: getDevices() not available — flag may be needed');
-            setState(hasStoredDevice() ? 'known' : 'disconnected');
-            return;
-        }
-        const devices = await navigator.bluetooth.getDevices().catch(() => []);
-        console.log('FORGE HR: getDevices() returned', devices.length, 'device(s)',
-                    devices.map(d => d.name));
-
-        const storedName = localStorage.getItem(DEVICE_KEY);
-        const target = devices.find(d => d.name === storedName)
-                    || devices.find(d => d.name)
-                    || devices[0];
-
-        if (!target) {
-            console.log('FORGE HR: no permitted device found');
-            setState(hasStoredDevice() ? 'known' : 'disconnected');
-            return;
-        }
-
-        console.log('FORGE HR: found', target.name, '— trying direct connect');
-        const ok = await connectToDevice(target);
-        if (!ok) {
-            console.log('FORGE HR: direct connect failed — falling back to watchAdvertisements');
-            watchAndConnect(target);
-        }
-    }
-
-    // ── Manual connect via picker (requires user gesture) ────────────────────
-    async function manualConnect() {
-        try {
-            setState('connecting');
-            const device = await navigator.bluetooth.requestDevice({
-                filters: [{ services: [HR_SERVICE] }],
-                optionalServices: [HR_SERVICE],
-            });
-            disconnectBound = false; // fresh device object
-            const ok = await connectToDevice(device);
-            if (!ok) watchAndConnect(device);
-        } catch (err) {
-            if (err.name !== 'NotFoundError' && err.name !== 'AbortError') {
-                console.warn('FORGE HR: picker failed —', err.message);
-            }
-            setState(hasStoredDevice() ? 'known' : 'disconnected');
-        }
-    }
-
-    // ── Full user-initiated disconnect ────────────────────────────────────────
-    async function fullDisconnect() {
-        try { watchAbort?.abort(); } catch (_) {}
-        watchAbort = null;
-        stopSampling();
-        await flushSamples();
-        if (bleChar) {
-            try { await bleChar.stopNotifications(); } catch (_) {}
-            bleChar.removeEventListener('characteristicvaluechanged', onHRNotification);
-            bleChar = null;
-        }
-        if (bleDevice) {
-            if (disconnectBound) {
-                bleDevice.removeEventListener('gattserverdisconnected', onDisconnect);
-                disconnectBound = false;
-            }
-            if (bleDevice.gatt.connected) bleDevice.gatt.disconnect();
-            bleDevice = null;
-        }
-        liveBpm = 0;
-        // Clear stored device so badge shows plain disconnected (not 'known')
-        localStorage.removeItem(DEVICE_KEY);
-        setState('disconnected');
-    }
-
-    // ── Public API ────────────────────────────────────────────────────────────
-    const pub = {
-        toggleConnect() {
-            if (state === 'connected') {
-                fullDisconnect();
-            } else if (state === 'disconnected' || state === 'known') {
-                manualConnect();
-            }
-            // connecting / watching: ignore tap
-        },
-        getBpm()   { return liveBpm; },
-        getState() { return state; },
-        // Returns the peak BPM over the last windowMs milliseconds, or null if no data.
-        getPeakBpm(windowMs = 20000) {
-            const cutoff = Date.now() - windowMs;
-            const recent = recentReadings.filter(r => r.ts >= cutoff);
-            if (!recent.length) return liveBpm > 0 ? liveBpm : null;
-            return Math.max(...recent.map(r => r.bpm));
-        },
-    };
-
-    // ── Init ──────────────────────────────────────────────────────────────────
-    if (navigator.bluetooth) {
-        renderBadge(); // show badge immediately
-        badge && (badge.style.display = 'flex');
-        setTimeout(autoReconnect, 600);
-    }
-
-    return pub;
-})();
+ <script>
+window.forgeHrConfig = { workoutId: <?= (int)$active['id'] ?> };
 </script>
+<script src="/forge/workout/hr-monitor.js?v=1"></script>
 
 <?php if ($active['type'] === 'cardio'): ?>
-<script>
-// ── Cardio session JS ─────────────────────────────────────────────────────
-const WORKOUT_ID     = <?= (int)$active['id'] ?>;
-const RESTING_HR     = <?= $profile_resting_hr ?>;
-const MAX_HR_PROFILE = <?= $profile_max_hr ?>;
-const CARDIO_EX_ID   = <?= (int)(array_key_first($exercises) ?? 0) ?>;
-
-// Register HR update hook for live display
-window.onForgeHRUpdate = updateCardioHrDisplay;
-
-// ── Session timer ─────────────────────────────────────────────────────────
-// Use localStorage so the timer starts at 0 on first visit and survives page refreshes.
-const CARDIO_LS_KEY = 'forge_cardio_start_<?= (int)$active['id'] ?>';
-let cardioStartMs;
-{
-    const stored = localStorage.getItem(CARDIO_LS_KEY);
-    if (stored) {
-        cardioStartMs = parseInt(stored, 10);
-    } else {
-        cardioStartMs = Date.now();
-        localStorage.setItem(CARDIO_LS_KEY, cardioStartMs);
-    }
-}
-
-function fmtElapsed(ms) {
-    const elapsed = Math.max(0, Math.floor(ms / 1000));
-    const h = Math.floor(elapsed / 3600);
-    const m = Math.floor((elapsed % 3600) / 60);
-    const s = elapsed % 60;
-    return h > 0
-        ? h + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0')
-        : m + ':' + String(s).padStart(2, '0');
-}
-
-function updateCardioTimer() {
-    const str = fmtElapsed(Date.now() - cardioStartMs);
-    document.getElementById('workout-duration').textContent = str;
-    document.getElementById('cardio-timer').textContent = str;
-}
-setInterval(updateCardioTimer, 1000);
-updateCardioTimer();
-
-// ── Wake Lock (keep screen on during session) ─────────────────────────────
-let wakeLock = null;
-async function requestWakeLock() {
-    if (!('wakeLock' in navigator)) return;
-    try { wakeLock = await navigator.wakeLock.request('screen'); } catch (_) {}
-}
-document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') requestWakeLock();
-});
-requestWakeLock();
-
-// ── Live HR display ───────────────────────────────────────────────────────
-let cardioHrSamples = [];
-
-function updateCardioHrDisplay(bpm) {
-    if (!bpm || bpm < 20) return;
-    cardioHrSamples.push(bpm);
-
-    document.getElementById('cardio-hr-bpm').textContent = bpm;
-    document.getElementById('cardio-hr-icon').style.color = '#FF5722';
-
-    const avg  = Math.round(cardioHrSamples.reduce((a, b) => a + b, 0) / cardioHrSamples.length);
-    const peak = Math.max(...cardioHrSamples);
-    document.getElementById('cardio-hr-avg').textContent  = avg;
-    document.getElementById('cardio-hr-peak').textContent = peak;
-
-    if (RESTING_HR && MAX_HR_PROFILE) {
-        const hrr  = Math.round((bpm - RESTING_HR) / (MAX_HR_PROFILE - RESTING_HR) * 100);
-        const pct  = Math.min(100, Math.max(0, hrr));
-        const hrrEl = document.getElementById('cardio-hrr-pct');
-        if (hrrEl) hrrEl.textContent = pct + '%';
-
-        const colour = hrr < 50 ? '#4caf50' : hrr < 70 ? '#ff9800' : '#ef5350';
-        document.getElementById('cardio-zone-fill').style.width      = pct + '%';
-        document.getElementById('cardio-zone-fill').style.background = colour;
-        document.getElementById('cardio-hr-icon').style.color        = colour;
-
-        const zoneEl = document.getElementById('cardio-hr-zone-label');
-        if (zoneEl) {
-            zoneEl.textContent = hrr < 50 ? 'ZONE 1 — EASY'
-                               : hrr < 60 ? 'ZONE 2 — FAT BURN'
-                               : hrr < 70 ? 'ZONE 3 — AEROBIC'
-                               : hrr < 85 ? 'ZONE 4 — THRESHOLD'
-                               :            'ZONE 5 — MAX EFFORT';
-        }
-    }
-}
-
-// ── Finish modal ──────────────────────────────────────────────────────────
-function openCardioFinishModal() {
-    if (wakeLock) { try { wakeLock.release(); } catch(_){} wakeLock = null; }
-    const elapsedMs = Date.now() - cardioStartMs;
-    const elapsed   = Math.max(0, Math.floor(elapsedMs / 1000));
-    const h = Math.floor(elapsed / 3600);
-    const m = Math.floor((elapsed % 3600) / 60);
-    const s = elapsed % 60;
-    document.getElementById('cardio-finish-duration').textContent =
-        h > 0 ? h + 'h ' + m + 'm ' + s + 's' : m + 'm ' + s + 's';
-    new bootstrap.Modal(document.getElementById('cardioFinishModal')).show();
-}
-
-async function confirmCardioFinish() {
-    const elapsed    = Math.max(1, Math.floor((Date.now() - cardioStartMs) / 1000));
-    const distance   = parseFloat(document.getElementById('cardio-finish-distance').value)   || null;
-    const elevation  = parseFloat(document.getElementById('cardio-finish-elevation').value)  || null;
-    const intensity  = parseInt(document.getElementById('cardio-finish-intensity').value)    || null;
-    const notes      = document.getElementById('cardio-finish-notes').value.trim()           || null;
-    const bodyweight = parseFloat(document.getElementById('cardio-finish-bodyweight').value) || null;
-
-    const btn = document.querySelector('#cardioFinishModal .btn-forge');
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Saving…';
-
-    const fd = new FormData();
-    fd.append('action',      'finish_cardio');
-    fd.append('workout_id',  WORKOUT_ID);
-    fd.append('exercise_id', CARDIO_EX_ID);
-    fd.append('duration_sec', elapsed);
-    if (distance   !== null) fd.append('distance_km',   distance);
-    if (elevation  !== null) fd.append('elevation_m',   elevation);
-    if (intensity  !== null) fd.append('intensity',     intensity);
-    if (notes      !== null) fd.append('notes',         notes);
-    if (bodyweight !== null) fd.append('bodyweight_kg', bodyweight);
-
-    const r = await fetch('/forge/core/api.php', { method: 'POST', body: fd }).then(r => r.json());
-
-    if (r.status === 'success') {
-        localStorage.removeItem(CARDIO_LS_KEY);
-        window.location.href = '/forge/history/?id=' + WORKOUT_ID;
-    } else {
-        btn.disabled = false;
-        btn.innerHTML = '<i class="bi bi-check-lg me-1"></i>SAVE &amp; FINISH';
-        alert('Error: ' + r.message);
-    }
-}
-
-async function cancelWorkout() {
-    if (!confirm('Cancel this cardio session? It will be deleted.')) return;
-    if (wakeLock) { try { wakeLock.release(); } catch(_){} wakeLock = null; }
-    localStorage.removeItem(CARDIO_LS_KEY);
-    const fd = new FormData();
-    fd.append('action', 'delete_workout');
-    fd.append('id', WORKOUT_ID);
-    const r = await fetch('/forge/core/api.php', { method: 'POST', body: fd }).then(r => r.json());
-    if (r.status === 'success') window.location.href = '/forge/workout/';
-    else alert('Error: ' + r.message);
-}
+ <script>
+window.forgeCardioConfig = { workoutId: <?= (int)$active['id'] ?>, exerciseId: <?= (int)(array_key_first($exercises) ?? 0) ?>, restingHr: <?= $profile_resting_hr ?>, maxHr: <?= $profile_max_hr ?> };
 </script>
+<script src="/forge/workout/cardio-session.js?v=1"></script>
 <?php endif; // end cardio JS ?>
 
 <?php else: ?>

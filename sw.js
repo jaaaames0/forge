@@ -6,6 +6,14 @@
 
 let timerId = null;
 
+self.addEventListener('install', (event) => {
+    event.waitUntil(self.skipWaiting());
+});
+
+self.addEventListener('activate', (event) => {
+    event.waitUntil(clients.claim());
+});
+
 self.addEventListener('message', (event) => {
     const { type, endMs, tag } = event.data || {};
 
@@ -19,9 +27,13 @@ self.addEventListener('message', (event) => {
         clearTimeout(timerId);
         const delay = endMs - Date.now();
         if (delay <= 0) {
-            fireNotification();
+            event.waitUntil(fireNotification());
         } else {
-            timerId = setTimeout(fireNotification, delay);
+            // This is deliberately only a best-effort backup. Service workers have
+            // no durable timer API and can be suspended before this callback runs.
+            timerId = setTimeout(() => {
+                fireNotification().catch(() => {});
+            }, delay);
         }
     }
 
@@ -43,7 +55,7 @@ async function fireNotification() {
     );
     if (forgeVisible) return;
 
-    self.registration.showNotification('FORGE — Rest done', {
+    await self.registration.showNotification('FORGE — Rest done', {
         body: 'Time to lift.',
         icon: '/forge/core/favicon.svg',
         badge: '/forge/core/favicon.svg',

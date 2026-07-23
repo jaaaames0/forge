@@ -64,10 +64,9 @@ $fat_kg  = ($smoothed_bf !== null && $bw) ? round($bw * ($smoothed_bf / 100), 1)
 
 // ── TREND DATA ─────────────────────────────────────────────────────────────
 $bw_history = $db->query("
-    SELECT bodyweight_kg, DATE(started_at) AS date
-    FROM workouts
-    WHERE bodyweight_kg IS NOT NULL AND bodyweight_kg > 0
-    ORDER BY started_at ASC
+    SELECT weight_kg AS bodyweight_kg, measured_at AS date
+    FROM bodyweight_measurements
+    ORDER BY measured_at ASC
 ")->fetchAll(PDO::FETCH_ASSOC);
 
 $hr_rows = $db->query("
@@ -343,7 +342,7 @@ window.forgeWarmupPresets = {
                             <?= $bw_history[0]['bodyweight_kg'] ?> → <?= end($bw_history)['bodyweight_kg'] ?> kg
                         </div>
                     </div>
-                    <div style="position:relative;height:80px;"><canvas id="bwChart"></canvas></div>
+                    <div style="position:relative;height:180px;"><canvas id="bwChart"></canvas></div>
                 </div>
                 <?php endif; ?>
                 <?php if (count($resting_hr_history) >= 2): ?>
@@ -615,11 +614,7 @@ window.forgeWarmupPresets = {
 
 <script>
 async function api(action, data = {}) {
-    const fd = new FormData();
-    fd.append('action', action);
-    for (const [k, v] of Object.entries(data)) if (v !== null && v !== undefined && v !== '') fd.append(k, v);
-    const r = await fetch('/forge/core/api.php', { method: 'POST', body: fd });
-    return r.json();
+    return window.forgeApi(action, data);
 }
 
 async function saveSetting(key, value) {
@@ -1038,15 +1033,15 @@ try { (function () {
     new Chart(document.getElementById('bwChart'), {
         ...CHART_DEFAULTS,
         data: {
-            labels: <?= json_encode(array_column($bw_history, 'date')) ?>,
-            datasets: [mkDataset(<?= json_encode(array_column($bw_history, 'bodyweight_kg')) ?>, '#FF5722')]
+            datasets: [mkDataset(<?= json_encode(array_map(fn($r) => ['x' => strtotime($r['date']) * 1000, 'y' => (float)$r['bodyweight_kg']], $bw_history)) ?>, '#FF5722')]
         },
         options: { ...CHART_DEFAULTS.options, scales: { ...CHART_DEFAULTS.options.scales,
+            x: { type: 'linear', display: true, grid: { color: '#1f1f1f' }, ticks: { color: '#888', maxTicksLimit: 5, font: { size: 9 }, callback: value => new Date(value).toLocaleDateString(undefined, { month: 'short', year: '2-digit' }) } },
             y: { ...CHART_DEFAULTS.options.scales.y,
                 min: Math.min(...<?= json_encode(array_column($bw_history, 'bodyweight_kg')) ?>) - 2,
                 max: Math.max(...<?= json_encode(array_column($bw_history, 'bodyweight_kg')) ?>) + 2,
             }
-        }}
+        }, plugins: { legend: { display: false }, tooltip: { callbacks: { title: items => new Date(items[0].parsed.x).toLocaleDateString(), label: ctx => ctx.parsed.y + ' kg' } } }}
     });
     <?php endif; ?>
 

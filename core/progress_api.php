@@ -14,7 +14,30 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 }
 
 $db     = get_db_connection();
+$active_era_id = active_training_era_id($db);
 $action = $_POST['action'] ?? '';
+
+function progress_scope(PDO $db, int $active_era_id): array {
+    $requested = (string)($_POST['cycle_context'] ?? 'current');
+    if ($requested === 'all') return ['', []];
+    if ($requested === 'era') return [' AND w.era_id = ?', [$active_era_id]];
+    if ($requested === 'current') {
+        $stmt = $db->prepare('SELECT era_id, starts_at, ends_at FROM training_cycles WHERE era_id = ? ORDER BY starts_at DESC LIMIT 1');
+        $stmt->execute([$active_era_id]); $cycle = $stmt->fetch(PDO::FETCH_ASSOC);
+    } elseif (ctype_digit($requested)) {
+        $stmt = $db->prepare('SELECT era_id, starts_at, ends_at FROM training_cycles WHERE id = ?');
+        $stmt->execute([(int)$requested]); $cycle = $stmt->fetch(PDO::FETCH_ASSOC);
+    } else {
+        $cycle = null;
+    }
+    if (!$cycle) return [' AND w.era_id = ?', [$active_era_id]];
+    $end = $cycle['ends_at'];
+    if (!empty($_POST['as_of'])) {
+        $requested_end = strtotime((string)$_POST['as_of']);
+        if ($requested_end !== false) $end = date('Y-m-d H:i:s', min(strtotime($end), $requested_end));
+    }
+    return [' AND w.era_id = ? AND w.started_at >= ? AND w.started_at <= ?', [(int)$cycle['era_id'], $cycle['starts_at'], $end]];
+}
 
 try {
 
@@ -104,8 +127,8 @@ try {
         echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
 
     } elseif ($action === 'get_weekly_volume') {
-        // Total volume per week for the last 12 weeks
-        $stmt = $db->query("
+        [$scope, $params] = progress_scope($db, $active_era_id);
+        $stmt = $db->prepare("
             SELECT strftime('%Y-W%W', w.started_at) as week,
                    SUM(ws.weight_kg * ws.reps) as volume_kg,
                    COUNT(DISTINCT w.id) as workout_count
@@ -115,10 +138,11 @@ try {
               AND ws.set_type = 'working'
               AND ws.weight_kg IS NOT NULL
               AND ws.reps IS NOT NULL
-              AND w.started_at >= date('now', '-84 days')
+              {$scope}
             GROUP BY week
             ORDER BY week ASC
         ");
+        $stmt->execute($params);
         echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
 
     } elseif ($action === 'get_muscle_distribution') {
@@ -141,15 +165,16 @@ try {
         echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
 
     } elseif ($action === 'get_workout_frequency') {
-        // Workout dates for the last 365 days (for heatmap)
-        $stmt = $db->query("
+        [$scope, $params] = progress_scope($db, $active_era_id);
+        $stmt = $db->prepare("
             SELECT DATE(started_at) as date, COUNT(*) as count
-            FROM workouts
+            FROM workouts w
             WHERE finished_at IS NOT NULL
-              AND started_at >= date('now', '-365 days')
+              {$scope}
             GROUP BY DATE(started_at)
             ORDER BY date ASC
         ");
+        $stmt->execute($params);
         echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
 
     } elseif ($action === 'get_recent_workouts') {
@@ -182,100 +207,10 @@ try {
         $te = $te->fetch(PDO::FETCH_ASSOC);
         if (!$te) throw new Exception('Template exercise not found');
 
-        // Find the most recent completed session for this exercise
-        // GROUP BY w.id ensures aggregates are scoped to one workout
-        $last = $db->prepare("
-            SELECT w.id as workout_id, w.finished_at,
-                   COUNT(ws.id) as set_count,
-                   AVG(ws.rpe) as avg_rpe,
-                   MIN(ws.reps) as min_reps,
-                   MAX(ws.reps) as max_reps,
-                   MAX(ws.weight_kg) as max_weight,
-                   MAX(ws.added_weight_kg) as max_added_weight
-            FROM workout_sets ws
-            JOIN workouts w ON w.id = ws.workout_id
-            WHERE ws.exercise_id = ?
-              AND ws.set_type = 'working'
-              AND w.finished_at IS NOT NULL
-            GROUP BY w.id
-            ORDER BY w.finished_at DESC
-            LIMIT 1
-        ");
-        $last->execute([$te['exercise_id']]);
-        $last_session = $last->fetch(PDO::FETCH_ASSOC);
-
-        if (!$last_session || !$last_session['workout_id']) {
-            echo json_encode(['status' => 'success', 'data' => ['suggestion' => null, 'message' => 'No previous session']]);
-            exit;
-        }
-
-        $scheme    = $te['progression_scheme'] ?? 'double';
-        $increment = (float)($te['progression_increment_kg'] ?? 2.5);
-        // For bodyweight exercises use added_weight as the progression reference
-        $is_bw       = $last_session['max_added_weight'] !== null;
-        $prog_weight = $is_bw ? (float)$last_session['max_added_weight'] : (float)$last_session['max_weight'];
-        $suggestion  = null;
-        $increase    = false;
-        $message     = '';
-
-        if ($scheme === 'linear') {
-            $target_sets = (int)($te['target_sets'] ?? 3);
-            $target_reps = (int)($te['target_reps_min'] ?? 5);
-            $hit_all = (int)$last_session['set_count'] >= $target_sets
-                    && (int)$last_session['min_reps'] >= $target_reps;
-            if ($hit_all) {
-                $suggestion = $prog_weight + $increment;
-                $increase   = true;
-                $message    = "All {$target_sets}×{$target_reps} hit — up {$increment}kg";
-            } else {
-                $suggestion = $prog_weight;
-                $message    = "Push for all {$target_sets}×{$target_reps} reps";
-            }
-
-        } elseif ($scheme === 'double') {
-            $reps_min = (int)($te['target_reps_min'] ?? 8);
-            $reps_max = (int)($te['target_reps_max'] ?? 12);
-            $target_sets = (int)($te['target_sets'] ?? 3);
-            $min_reps    = (int)$last_session['min_reps'];
-            $set_count   = (int)$last_session['set_count'];
-            $hit_top = $min_reps >= $reps_max && $set_count >= $target_sets;
-            if ($hit_top) {
-                $suggestion = $prog_weight + $increment;
-                $increase   = true;
-                $message    = "All {$target_sets} sets hit {$reps_max} reps — add {$increment}kg, aim for {$reps_min}+";
-            } else {
-                $suggestion = $prog_weight;
-                $message    = "Push for {$reps_max} reps on all {$target_sets} sets (best: {$min_reps})";
-            }
-
-        } elseif ($scheme === 'rpe') {
-            $target_rpe = (float)($te['target_rpe'] ?? 8.0);
-            $avg_rpe    = $last_session['avg_rpe'] ? round((float)$last_session['avg_rpe'], 1) : null;
-            if ($avg_rpe && $avg_rpe < $target_rpe - 1) {
-                $suggestion = $prog_weight + 2.5;
-                $increase   = true;
-                $message    = "Avg RPE {$avg_rpe} (target {$target_rpe}) — add 2.5kg";
-            } elseif ($avg_rpe && $avg_rpe > $target_rpe + 0.5) {
-                $suggestion = max(0, $prog_weight - 2.5);
-                $message    = "Avg RPE {$avg_rpe} above target — consider −2.5kg";
-            } else {
-                $suggestion = $prog_weight;
-                $message    = "RPE on target — maintain weight";
-            }
-        }
-
-        echo json_encode([
-            'status' => 'success',
-            'data'   => [
-                'suggestion'  => $suggestion,
-                'increase'    => $increase,
-                'message'     => $message,
-                'prog_weight' => $prog_weight,
-                'is_bw'       => $is_bw,
-                'scheme'      => $scheme,
-                'last_session' => $last_session,
-            ]
-        ]);
+        // Keep this endpoint aligned with the homepage and workout UI.
+        // Progression rules have one source of truth in db_helper.php.
+        $suggestion = compute_progression_suggestion($db, $te);
+        echo json_encode(['status' => 'success', 'data' => $suggestion]);
 
     // =========================================================
     // CARDIO HISTORY (time-series per exercise)
@@ -460,6 +395,7 @@ try {
         foreach ($id_stmt->fetchAll(PDO::FETCH_ASSOC) as $row) $id_map[$row['id']] = $row['name'];
 
         $result = [];
+        [$scope_sql, $scope_params] = progress_scope($db, $active_era_id);
         foreach ($id_map as $eid => $name) {
             $stmt = $db->prepare("
                 SELECT DATE(w.started_at) as date,
@@ -469,10 +405,11 @@ try {
                 WHERE ws.exercise_id = ?
                   AND ws.reps > 1 AND ws.reps <= 30 AND ws.weight_kg > 0
                   AND ws.set_type = 'working' AND w.finished_at IS NOT NULL
+                  {$scope_sql}
                 GROUP BY DATE(w.started_at)
                 ORDER BY date ASC
             ");
-            $stmt->execute([$eid]);
+            $stmt->execute([$eid, ...$scope_params]);
             $result[$name] = $stmt->fetchAll(PDO::FETCH_ASSOC);
         }
         echo json_encode(['status' => 'success', 'data' => $result]);
@@ -502,16 +439,17 @@ try {
 
     } elseif ($action === 'get_cardio_efficiency_trend') {
         // Cardiac efficiency over time, grouped by exercise
-        $stmt = $db->query("
+        [$scope_sql, $scope_params] = progress_scope($db, $active_era_id);
+        $stmt = $db->prepare("
             SELECT DATE(w.started_at) as date, e.name as exercise_name,
                    ROUND(ws.distance_km / (ws.duration_sec / 3600.0) / ws.hr_avg * 1000, 3) as efficiency
             FROM workout_sets ws
             JOIN workouts w ON w.id = ws.workout_id
             JOIN exercises e ON e.id = ws.exercise_id
             WHERE w.finished_at IS NOT NULL AND e.category = 'Cardio'
-              AND ws.duration_sec > 0 AND ws.distance_km > 0 AND ws.hr_avg > 0
+              AND ws.duration_sec > 0 AND ws.distance_km > 0 AND ws.hr_avg > 0{$scope_sql}
             ORDER BY w.started_at ASC
-        ");
+        "); $stmt->execute($scope_params);
         $by_ex = [];
         foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $r) {
             $by_ex[$r['exercise_name']][] = ['date' => $r['date'], 'value' => (float)$r['efficiency']];
@@ -520,7 +458,9 @@ try {
 
     } elseif ($action === 'get_cardio_volume_trend') {
         // Weekly cardio km + duration for last 12 weeks
-        $stmt = $db->query("
+        [$scope_sql, $scope_params] = progress_scope($db, $active_era_id);
+        $date_clause = $scope_sql === '' || str_contains($scope_sql, 'era_id = ?') && count($scope_params) === 1 ? " AND w.started_at >= date('now', '-84 days')" : '';
+        $stmt = $db->prepare("
             SELECT strftime('%Y-W%W', w.started_at) as week,
                    ROUND(SUM(COALESCE(ws.distance_km, 0)), 2) as total_km,
                    SUM(COALESCE(ws.duration_sec, 0)) as total_sec
@@ -528,10 +468,10 @@ try {
             JOIN workouts w ON w.id = ws.workout_id
             JOIN exercises e ON e.id = ws.exercise_id
             WHERE w.finished_at IS NOT NULL AND e.category = 'Cardio'
-              AND w.started_at >= date('now', '-84 days')
+              {$scope_sql}{$date_clause}
             GROUP BY week
             ORDER BY week ASC
-        ");
+        "); $stmt->execute($scope_params);
         echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
 
     } else {

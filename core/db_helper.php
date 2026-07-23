@@ -5,8 +5,10 @@
 
 date_default_timezone_set('Australia/Sydney');
 
+const FORGE_SCHEMA_VERSION = 5;
+
 function get_db_connection(): PDO {
-    $dbPath = __DIR__ . '/../database/forge.db';
+    $dbPath = getenv('FORGE_DB_PATH') ?: __DIR__ . '/../database/forge.db';
     $db = new PDO('sqlite:' . $dbPath);
     $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $db->exec('PRAGMA busy_timeout = 5000;');
@@ -14,10 +16,32 @@ function get_db_connection(): PDO {
     $db->exec('PRAGMA foreign_keys = ON;');
     maybe_migrate_schema($db);
     maybe_seed_exercises($db);
+    backfill_current_bodyweight_measurements($db);
     return $db;
 }
 
+/** Keep current-era workout weigh-ins available for interpolation. */
+function backfill_current_bodyweight_measurements(PDO $db): void {
+    $era_id = $db->query('SELECT id FROM training_eras WHERE is_active = 1 ORDER BY id DESC LIMIT 1')->fetchColumn();
+    if (!$era_id) return;
+    $stmt = $db->prepare("INSERT INTO bodyweight_measurements (measured_at, weight_kg, era_id, workout_id, source)
+        SELECT w.started_at, w.bodyweight_kg, w.era_id, w.id, 'workout'
+        FROM workouts w
+        WHERE w.era_id = ? AND w.bodyweight_kg IS NOT NULL AND w.bodyweight_kg > 0
+          AND NOT EXISTS (SELECT 1 FROM bodyweight_measurements bm WHERE bm.workout_id = w.id AND bm.source = 'workout')");
+    $stmt->execute([$era_id]);
+}
+
 function maybe_migrate_schema(PDO $db): void {
+    // Older installations predate schema tracking. Run the compatibility upgrade
+    // once, then avoid repeated PRAGMA/DDL work on every page request.
+    $db->exec("CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )");
+    $current_version = (int)$db->query('SELECT COALESCE(MAX(version), 0) FROM schema_migrations')->fetchColumn();
+    if ($current_version >= FORGE_SCHEMA_VERSION) return;
+
     // exercises.bw_factor
     $ex_cols = array_column($db->query("PRAGMA table_info(exercises)")->fetchAll(PDO::FETCH_ASSOC), 'name');
     if (!in_array('bw_factor', $ex_cols)) {
@@ -159,8 +183,142 @@ function maybe_migrate_schema(PDO $db): void {
         waist_cm        REAL,
         neck_cm         REAL,
         hip_cm          REAL,
-        caliper_bf_pct  REAL
+        caliper_bf_pct  REAL,
+        source          TEXT DEFAULT 'manual'
     )");
+    $db->exec("CREATE TABLE IF NOT EXISTS bodyweight_measurements (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        measured_at TEXT NOT NULL,
+        weight_kg REAL NOT NULL,
+        era_id INTEGER DEFAULT NULL REFERENCES training_eras(id),
+        workout_id INTEGER DEFAULT NULL REFERENCES workouts(id) ON DELETE SET NULL,
+        source TEXT DEFAULT 'workout'
+    )");
+
+    // Training eras keep historical imports available without allowing them to
+    // distort the current training cycle's progression and records.
+    $db->exec("CREATE TABLE IF NOT EXISTS training_eras (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        starts_at TEXT NOT NULL,
+        ends_at TEXT DEFAULT NULL,
+        is_active INTEGER NOT NULL DEFAULT 0,
+        source TEXT NOT NULL DEFAULT 'forge',
+        notes TEXT DEFAULT NULL
+    )");
+    $db->exec("CREATE TABLE IF NOT EXISTS training_cycles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        era_id INTEGER NOT NULL REFERENCES training_eras(id) ON DELETE CASCADE,
+        cycle_type TEXT NOT NULL,
+        starts_at TEXT NOT NULL,
+        ends_at TEXT NOT NULL,
+        label TEXT DEFAULT NULL,
+        source TEXT NOT NULL DEFAULT 'auto',
+        confidence REAL DEFAULT NULL,
+        metrics_json TEXT DEFAULT NULL
+    )");
+    $wk_cols = array_column($db->query("PRAGMA table_info(workouts)")->fetchAll(PDO::FETCH_ASSOC), 'name');
+    if (!in_array('era_id', $wk_cols)) {
+        $db->exec("ALTER TABLE workouts ADD COLUMN era_id INTEGER DEFAULT NULL REFERENCES training_eras(id)");
+    }
+    $bm_cols = array_column($db->query("PRAGMA table_info(body_measurements)")->fetchAll(PDO::FETCH_ASSOC), 'name');
+    if (!in_array('era_id', $bm_cols)) {
+        $db->exec("ALTER TABLE body_measurements ADD COLUMN era_id INTEGER DEFAULT NULL REFERENCES training_eras(id)");
+    }
+    if (!in_array('source', $bm_cols)) {
+        $db->exec("ALTER TABLE body_measurements ADD COLUMN source TEXT DEFAULT 'manual'");
+    }
+
+    $active_era = $db->query("SELECT id FROM training_eras WHERE is_active = 1 ORDER BY id DESC LIMIT 1")->fetchColumn();
+    if (!$active_era) {
+        $first_workout = $db->query("SELECT MIN(started_at) FROM workouts")->fetchColumn();
+        $starts_at = $first_workout ?: date('Y-m-d H:i:s');
+        $db->prepare("INSERT INTO training_eras (name, starts_at, is_active, source) VALUES (?, ?, 1, 'forge')")
+           ->execute(['Forge — current era', $starts_at]);
+        $active_era = (int)$db->lastInsertId();
+    }
+    $db->prepare("UPDATE workouts SET era_id = ? WHERE era_id IS NULL")->execute([$active_era]);
+    $db->prepare("UPDATE body_measurements SET era_id = ? WHERE era_id IS NULL")->execute([$active_era]);
+
+    // Keep the common history and dashboard lookups fast as workout history grows.
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_workout_sets_workout ON workout_sets(workout_id)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_workout_sets_exercise_workout ON workout_sets(exercise_id, workout_id)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_workouts_finished_started ON workouts(finished_at, started_at)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_workouts_era_finished ON workouts(era_id, finished_at, started_at)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_training_cycles_era_dates ON training_cycles(era_id, starts_at, ends_at)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_personal_records_exercise_1rm ON personal_records(exercise_id, estimated_1rm DESC)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_cardio_records_exercise_type_value ON cardio_records(exercise_id, record_type, value DESC)');
+    $db->prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)')
+       ->execute([FORGE_SCHEMA_VERSION]);
+}
+
+/** Ensure that a workout can still accept live-session mutations. */
+function require_active_workout(PDO $db, int $workout_id): void {
+    $stmt = $db->prepare('SELECT 1 FROM workouts WHERE id = ? AND finished_at IS NULL');
+    $stmt->execute([$workout_id]);
+    if (!$stmt->fetchColumn()) {
+        throw new Exception('Workout is not active');
+    }
+}
+
+/** Return the era used for current-cycle views and new workouts. */
+function active_training_era_id(PDO $db): int {
+    $id = $db->query('SELECT id FROM training_eras WHERE is_active = 1 ORDER BY id DESC LIMIT 1')->fetchColumn();
+    if (!$id) throw new RuntimeException('No active training era configured');
+    return (int)$id;
+}
+
+/** User-facing cycle terminology, kept separate from stored identifiers. */
+function forge_cycle_label(string $type): string {
+    return $type === 'maintenance' ? 'Recomposition' : ucfirst($type);
+}
+
+function workout_last_activity_at(PDO $db, int $workout_id, string $started_at): string {
+    $stmt = $db->prepare("SELECT MAX(activity_at) FROM (
+        SELECT logged_at AS activity_at FROM workout_sets WHERE workout_id = ? AND logged_at IS NOT NULL
+        UNION ALL
+        SELECT sampled_at AS activity_at FROM workout_hr_samples WHERE workout_id = ?
+    )");
+    $stmt->execute([$workout_id, $workout_id]);
+    return $stmt->fetchColumn() ?: $started_at;
+}
+
+/**
+ * Close abandoned sessions on the next Forge interaction. A session with no
+ * logged set is discarded; otherwise it ends shortly after its last meaningful
+ * activity so accidental overnight timers do not distort history.
+ */
+function cleanup_stale_active_workouts(PDO $db, int $idle_seconds = 3600): array {
+    $active = $db->query("SELECT id, started_at FROM workouts WHERE finished_at IS NULL")->fetchAll(PDO::FETCH_ASSOC);
+    $closed = [];
+    foreach ($active as $workout) {
+        $last_activity = workout_last_activity_at($db, (int)$workout['id'], $workout['started_at']);
+        if (time() - strtotime($last_activity) < $idle_seconds) continue;
+
+        $set_count = $db->prepare('SELECT COUNT(*) FROM workout_sets WHERE workout_id = ?');
+        $set_count->execute([(int)$workout['id']]);
+        if (!(int)$set_count->fetchColumn()) {
+            $db->prepare('DELETE FROM workouts WHERE id = ?')->execute([(int)$workout['id']]);
+            $closed[] = ['id' => (int)$workout['id'], 'discarded' => true];
+            continue;
+        }
+
+        $finished_at = date('Y-m-d H:i:s', strtotime($last_activity . ' +2 minutes'));
+        $db->prepare('UPDATE workouts SET finished_at = ? WHERE id = ?')->execute([$finished_at, (int)$workout['id']]);
+        $closed[] = ['id' => (int)$workout['id'], 'discarded' => false];
+    }
+    if ($closed) rebuild_derived_records($db);
+    return $closed;
+}
+
+/** Ensure an exercise was intentionally added to this active workout. */
+function require_active_workout_exercise(PDO $db, int $workout_id, int $exercise_id): void {
+    require_active_workout($db, $workout_id);
+    $stmt = $db->prepare('SELECT 1 FROM workout_exercises WHERE workout_id = ? AND exercise_id = ?');
+    $stmt->execute([$workout_id, $exercise_id]);
+    if (!$stmt->fetchColumn()) {
+        throw new Exception('Exercise is not part of this workout');
+    }
 }
 
 function get_user_setting(PDO $db, string $key, string $default = ''): string {
@@ -247,6 +405,89 @@ function maybe_update_cardio_pr(PDO $db, int $exercise_id, ?int $duration_sec, ?
 }
 
 /**
+ * Rebuild record summaries from completed workouts.
+ *
+ * personal_records and cardio_records are derived data, not the source of
+ * truth. Rebuilding them after deleting history prevents stale PRs, cardio
+ * records, and set badges from surviving after their source workout is gone.
+ * Call this inside an existing transaction.
+ */
+function rebuild_derived_records(PDO $db): void {
+    $era_id = active_training_era_id($db);
+    $db->exec('DELETE FROM personal_records');
+    $db->exec('DELETE FROM cardio_records');
+    $db->exec("UPDATE workout_sets SET is_pr = 0
+               WHERE workout_id IN (SELECT id FROM workouts WHERE finished_at IS NOT NULL)");
+
+    $sets = $db->query("
+        SELECT ws.id, ws.exercise_id, ws.weight_kg, ws.reps, ws.duration_sec,
+               ws.distance_km, ws.hr_avg, ws.intensity, e.category, w.finished_at
+        FROM workout_sets ws
+        JOIN workouts w ON w.id = ws.workout_id
+        JOIN exercises e ON e.id = ws.exercise_id
+        WHERE w.finished_at IS NOT NULL AND ws.set_type = 'working' AND (w.era_id = ? OR w.era_id IS NULL)
+        ORDER BY w.finished_at ASC, w.id ASC, ws.id ASC
+    ");
+    $sets->execute([$era_id]);
+    $sets = $sets->fetchAll(PDO::FETCH_ASSOC);
+
+    $strength_bests = [];
+    $cardio_bests = [];
+    $insert_strength = $db->prepare(
+        'INSERT INTO personal_records (exercise_id, weight_kg, reps, estimated_1rm, achieved_at) VALUES (?, ?, ?, ?, ?)'
+    );
+    $insert_cardio = $db->prepare(
+        'INSERT INTO cardio_records (exercise_id, record_type, value, duration_sec, distance_km, avg_hr, intensity, achieved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    );
+    $mark_pr = $db->prepare('UPDATE workout_sets SET is_pr = 1 WHERE id = ?');
+
+    foreach ($sets as $set) {
+        $exercise_id = (int)$set['exercise_id'];
+        $is_pr = false;
+
+        if ($set['category'] === 'Cardio') {
+            $duration = $set['duration_sec'] !== null ? (int)$set['duration_sec'] : null;
+            $distance = $set['distance_km'] !== null ? (float)$set['distance_km'] : null;
+            $hr_avg = $set['hr_avg'] !== null ? (int)$set['hr_avg'] : null;
+            $metrics = [];
+            if ($duration !== null && $duration > 0 && $distance !== null && $distance > 0) {
+                $speed = round($distance / ($duration / 3600.0), 4);
+                $metrics['avg_speed'] = $speed;
+                if ($hr_avg !== null && $hr_avg > 0) {
+                    $metrics['cardiac_efficiency'] = round($speed / $hr_avg * 1000, 4);
+                }
+            }
+            if ($distance !== null && $distance > 0) $metrics['best_distance'] = $distance;
+            if ($duration !== null && $duration > 0) $metrics['best_duration'] = $duration;
+
+            foreach ($metrics as $type => $value) {
+                $key = "{$exercise_id}:{$type}";
+                if (!isset($cardio_bests[$key]) || $value > $cardio_bests[$key]) {
+                    $insert_cardio->execute([
+                        $exercise_id, $type, $value, $duration, $distance, $hr_avg,
+                        $set['intensity'] !== null ? (int)$set['intensity'] : null,
+                        $set['finished_at'],
+                    ]);
+                    $cardio_bests[$key] = $value;
+                    $is_pr = true;
+                }
+            }
+        } elseif ($set['weight_kg'] !== null && $set['reps'] !== null) {
+            $estimated = estimate_1rm((float)$set['weight_kg'], (int)$set['reps']);
+            if ($estimated !== null && (!isset($strength_bests[$exercise_id]) || $estimated > $strength_bests[$exercise_id])) {
+                $insert_strength->execute([
+                    $exercise_id, (float)$set['weight_kg'], (int)$set['reps'], $estimated, $set['finished_at'],
+                ]);
+                $strength_bests[$exercise_id] = $estimated;
+                $is_pr = true;
+            }
+        }
+
+        if ($is_pr) $mark_pr->execute([(int)$set['id']]);
+    }
+}
+
+/**
  * Compute a progression suggestion for an exercise given its template_exercise config.
  * Returns array with keys: suggestion, increase, message, scheme, is_bw
  * Returns null if no progression scheme is configured.
@@ -257,6 +498,7 @@ function compute_progression_suggestion(PDO $db, array $te): ?array {
     $exercise_id = (int)$te['exercise_id'];
     $scheme      = $te['progression_scheme'];
     $increment   = (float)($te['progression_increment_kg'] ?? 2.5);
+    $era_id      = active_training_era_id($db);
 
     // Last completed session for this exercise (aggregated per workout)
     $stmt = $db->prepare("
@@ -271,11 +513,12 @@ function compute_progression_suggestion(PDO $db, array $te): ?array {
         WHERE ws.exercise_id = ?
           AND ws.set_type = 'working'
           AND w.finished_at IS NOT NULL
+          AND (w.era_id = ? OR w.era_id IS NULL)
         GROUP BY w.id
         ORDER BY w.finished_at DESC
         LIMIT 1
     ");
-    $stmt->execute([$exercise_id]);
+    $stmt->execute([$exercise_id, $era_id]);
     $last = $stmt->fetch(PDO::FETCH_ASSOC);
 
     if (!$last) {
@@ -321,12 +564,12 @@ function compute_progression_suggestion(PDO $db, array $te): ?array {
         $target_rpe = (float)($te['target_rpe'] ?? 8.0);
         $avg_rpe    = $last['avg_rpe'] ? round((float)$last['avg_rpe'], 1) : null;
         if ($avg_rpe && $avg_rpe < $target_rpe - 1) {
-            $suggestion = $prog_weight + 2.5;
+            $suggestion = $prog_weight + $increment;
             $increase   = true;
-            $message    = "RPE {$avg_rpe} (target {$target_rpe}) — add 2.5kg";
+            $message    = "RPE {$avg_rpe} (target {$target_rpe}) — add {$increment}kg";
         } elseif ($avg_rpe && $avg_rpe > $target_rpe + 0.5) {
-            $suggestion = max(0.0, $prog_weight - 2.5);
-            $message    = "RPE {$avg_rpe} above target — consider −2.5kg";
+            $suggestion = max(0.0, $prog_weight - $increment);
+            $message    = "RPE {$avg_rpe} above target — consider −{$increment}kg";
         } else {
             $message = $avg_rpe ? "RPE {$avg_rpe} on target — maintain weight" : "Log RPE to enable auto-regulation";
         }

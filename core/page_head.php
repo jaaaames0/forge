@@ -22,8 +22,9 @@
     <meta name="theme-color" content="#FF5722">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
-    <link rel="stylesheet" href="/forge/core/forge.css?v=4">
+    <link rel="stylesheet" href="/forge/core/forge.css?v=5">
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="/forge/core/api-client.js?v=1"></script>
     <?= $extra_head ?? '' ?>
     <?= $extra_styles ?? '' ?>
 </head>

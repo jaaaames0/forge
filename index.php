@@ -3,6 +3,7 @@ require_once __DIR__ . '/core/auth.php';
 require_once __DIR__ . '/core/db_helper.php';
 
 $db       = get_db_connection();
+$stale_workouts = cleanup_stale_active_workouts($db);
 $unit     = 'kg';
 $time_fmt = 'H:i';
 
@@ -10,7 +11,11 @@ $time_fmt = 'H:i';
 $active = $db->query("SELECT * FROM workouts WHERE finished_at IS NULL ORDER BY started_at DESC LIMIT 1")->fetch(PDO::FETCH_ASSOC);
 
 // ── NEXT TEMPLATE ──────────────────────────────────────────────────────────
-$next_template = $db->query("
+// Rotate only templates that are part of the current program. Older templates
+// remain available manually, but should not block a replacement split forever.
+$rotation_window_days = 21;
+$rotation_cutoff = date('Y-m-d H:i:s', strtotime("-{$rotation_window_days} days"));
+$template_usage_sql = "
     SELECT t.id, t.name,
            COUNT(DISTINCT te.id)    as exercise_count,
            COUNT(DISTINCT w.id)     as use_count,
@@ -19,9 +24,24 @@ $next_template = $db->query("
     LEFT JOIN template_exercises te ON te.template_id = t.id
     LEFT JOIN workouts w ON w.template_id = t.id AND w.finished_at IS NOT NULL
     GROUP BY t.id
-    ORDER BY COALESCE(MAX(w.finished_at), '1970-01-01') ASC, use_count DESC
+";
+$next_stmt = $db->prepare($template_usage_sql . "
+    HAVING MAX(w.finished_at) >= ?
+        OR (MAX(w.finished_at) IS NULL AND t.created_at >= ?)
+    ORDER BY COALESCE(MAX(w.finished_at), t.created_at) ASC, use_count DESC
     LIMIT 1
-")->fetch(PDO::FETCH_ASSOC);
+");
+$next_stmt->execute([$rotation_cutoff, $rotation_cutoff]);
+$next_template = $next_stmt->fetch(PDO::FETCH_ASSOC);
+
+// After a long break, resume the most recently used program instead of
+// reviving the oldest abandoned template.
+if (!$next_template) {
+    $next_template = $db->query($template_usage_sql . "
+        ORDER BY COALESCE(MAX(w.finished_at), t.created_at) DESC
+        LIMIT 1
+    ")->fetch(PDO::FETCH_ASSOC);
+}
 
 // ── LAST SESSION ───────────────────────────────────────────────────────────
 $last_session = $db->query("

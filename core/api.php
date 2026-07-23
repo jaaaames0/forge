@@ -5,6 +5,8 @@
  */
 require_once __DIR__ . '/auth.php';
 require_once __DIR__ . '/db_helper.php';
+require_once __DIR__ . '/cycle_analysis.php';
+require_once __DIR__ . '/../scripts/analyze_training_cycles.php';
 
 header('Content-Type: application/json');
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
@@ -14,7 +16,46 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 }
 
 $db     = get_db_connection();
+$stale_workouts = cleanup_stale_active_workouts($db);
+$active_era_id = active_training_era_id($db);
 $action = $_POST['action'] ?? '';
+
+function nullable_positive_int(string $key): ?int {
+    $raw = trim((string)($_POST[$key] ?? ''));
+    if ($raw === '') return null;
+    if (filter_var($raw, FILTER_VALIDATE_INT) === false || (int)$raw < 1) {
+        throw new Exception("{$key} must be a positive integer");
+    }
+    return (int)$raw;
+}
+
+function nullable_rpe_target(): ?float {
+    $raw = trim((string)($_POST['target_rpe'] ?? ''));
+    if ($raw === '') return null;
+    if (!is_numeric($raw) || (float)$raw < 1 || (float)$raw > 10) {
+        throw new Exception('target_rpe must be between 1 and 10');
+    }
+    return (float)$raw;
+}
+
+function validated_template_progression(): array {
+    $sets = nullable_positive_int('target_sets');
+    $reps_min = nullable_positive_int('target_reps_min');
+    $reps_max = nullable_positive_int('target_reps_max');
+    if ($reps_min !== null && $reps_max !== null && $reps_max < $reps_min) {
+        throw new Exception('target_reps_max must be at least target_reps_min');
+    }
+    $scheme = $_POST['progression_scheme'] ?? 'double';
+    if (!in_array($scheme, ['linear', 'double', 'rpe'], true)) {
+        throw new Exception('Invalid progression scheme');
+    }
+    $increment_raw = trim((string)($_POST['progression_increment_kg'] ?? ''));
+    $increment = $increment_raw === '' ? 2.5 : (float)$increment_raw;
+    if (!is_numeric($increment_raw === '' ? '2.5' : $increment_raw) || $increment <= 0) {
+        throw new Exception('progression_increment_kg must be positive');
+    }
+    return [$sets, $reps_min, $reps_max, nullable_rpe_target(), $scheme, $increment];
+}
 
 try {
 
@@ -25,6 +66,31 @@ try {
     if ($action === 'list_exercises') {
         $stmt = $db->query("SELECT * FROM exercises ORDER BY muscle_primary, name");
         echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+
+    } elseif ($action === 'preview_cycle_detection') {
+        $proposal = forge_detect_training_cycles($db);
+        $current = $db->query('SELECT era_id, cycle_type, starts_at, ends_at FROM training_cycles ORDER BY era_id, starts_at')->fetchAll(PDO::FETCH_ASSOC);
+        $proposed = array_map(static fn($s) => ['era_id' => $s[0], 'cycle_type' => $s[1], 'starts_at' => $s[2], 'ends_at' => $s[3]], $proposal);
+        $signature = static fn(array $cycles): array => array_map(static fn($c) => implode('|', [$c['era_id'], $c['cycle_type'], $c['starts_at'], $c['ends_at']]), $cycles);
+        $current_signatures = $signature($current); $proposed_signatures = $signature($proposed);
+        $removed = array_values(array_filter($current, static fn($c) => !in_array(implode('|', [$c['era_id'], $c['cycle_type'], $c['starts_at'], $c['ends_at']]), $proposed_signatures, true)));
+        $added = array_values(array_filter($proposed, static fn($c) => !in_array(implode('|', [$c['era_id'], $c['cycle_type'], $c['starts_at'], $c['ends_at']]), $current_signatures, true)));
+        $proposal_signature = hash('sha256', json_encode($proposed));
+        echo json_encode(['status' => 'success', 'data' => [
+            'current_count' => count($current), 'proposed_count' => count($proposed),
+            'changed' => $current_signatures !== $proposed_signatures, 'added' => $added, 'removed' => $removed,
+            'proposal_signature' => $proposal_signature,
+        ]]);
+
+    } elseif ($action === 'apply_cycle_detection') {
+        $proposal = forge_detect_training_cycles($db);
+        $expected_signature = (string)($_POST['proposal_signature'] ?? '');
+        $actual_signature = hash('sha256', json_encode(array_map(static fn($s) => ['era_id' => $s[0], 'cycle_type' => $s[1], 'starts_at' => $s[2], 'ends_at' => $s[3]], $proposal)));
+        if ($expected_signature === '' || !hash_equals($actual_signature, $expected_signature)) {
+            throw new Exception('Cycle data changed after this preview. Please reanalyse before applying.');
+        }
+        $saved = forge_apply_detected_cycles($db, $proposal);
+        echo json_encode(['status' => 'success', 'saved' => $saved]);
 
     } elseif ($action === 'add_exercise') {
         $name     = trim($_POST['name'] ?? '');
@@ -105,32 +171,49 @@ try {
         $intensity = (isset($_POST['intensity'])     && $_POST['intensity']     !== '') ? (int)$_POST['intensity']      : null;
         $notes       = $_POST['notes'] ?? null;
         $bodyweight  = (isset($_POST['bodyweight_kg']) && $_POST['bodyweight_kg'] !== '') ? (float)$_POST['bodyweight_kg'] : null;
+        if ($duration === null || $duration <= 0) throw new Exception('Duration must be positive');
+        if ($distance !== null && $distance < 0) throw new Exception('Distance cannot be negative');
+        if ($elevation !== null && $elevation < 0) throw new Exception('Elevation cannot be negative');
+        if ($intensity !== null && ($intensity < 1 || $intensity > 10)) throw new Exception('Intensity must be between 1 and 10');
 
-        // Auto-compute avg/max HR from samples collected during this session
-        $bpm_stmt = $db->prepare("SELECT bpm FROM workout_hr_samples WHERE workout_id = ?");
-        $bpm_stmt->execute([$workout_id]);
-        $bpms  = array_column($bpm_stmt->fetchAll(PDO::FETCH_ASSOC), 'bpm');
-        $hr_avg = !empty($bpms) ? (int)round(array_sum($bpms) / count($bpms)) : null;
-        $hr_max = !empty($bpms) ? (int)max($bpms) : null;
+        $db->beginTransaction();
+        try {
+            require_active_workout($db, $workout_id);
+            $exercise = $db->prepare('SELECT category FROM exercises WHERE id = ?');
+            $exercise->execute([$exercise_id]);
+            if ($exercise->fetchColumn() !== 'Cardio') throw new Exception('Exercise must be cardio');
 
-        $now = date('Y-m-d H:i:s');
+            // Auto-compute avg/max HR from samples collected during this session.
+            $bpm_stmt = $db->prepare("SELECT bpm FROM workout_hr_samples WHERE workout_id = ?");
+            $bpm_stmt->execute([$workout_id]);
+            $bpms  = array_column($bpm_stmt->fetchAll(PDO::FETCH_ASSOC), 'bpm');
+            $hr_avg = !empty($bpms) ? (int)round(array_sum($bpms) / count($bpms)) : null;
+            $hr_max = !empty($bpms) ? (int)max($bpms) : null;
+            $now = date('Y-m-d H:i:s');
 
-        // Insert the single session row
-        $db->prepare("
-            INSERT INTO workout_sets
-              (workout_id, exercise_id, set_number, set_type, duration_sec, distance_km,
-               elevation_m, hr_avg, hr_max, intensity, notes, logged_at)
-            VALUES (?, ?, 1, 'working', ?, ?, ?, ?, ?, ?, ?, ?)
-        ")->execute([$workout_id, $exercise_id, $duration, $distance, $elevation, $hr_avg, $hr_max, $intensity, $notes, $now]);
+            $db->prepare("
+                INSERT INTO workout_sets
+                  (workout_id, exercise_id, set_number, set_type, duration_sec, distance_km,
+                   elevation_m, hr_avg, hr_max, intensity, notes, logged_at)
+                VALUES (?, ?, 1, 'working', ?, ?, ?, ?, ?, ?, ?, ?)
+            ")->execute([$workout_id, $exercise_id, $duration, $distance, $elevation, $hr_avg, $hr_max, $intensity, $notes, $now]);
+            $db->prepare("UPDATE workouts SET finished_at = ?, bodyweight_kg = ? WHERE id = ?")
+               ->execute([$now, $bodyweight, $workout_id]);
+            if ($bodyweight !== null) {
+                set_user_setting($db, 'bodyweight_kg', (string)$bodyweight);
+                $db->prepare("INSERT INTO bodyweight_measurements (measured_at, weight_kg, era_id, workout_id, source)
+                    SELECT started_at, ?, era_id, id, 'workout' FROM workouts WHERE id = ?
+                    ON CONFLICT DO NOTHING")
+                   ->execute([$bodyweight, $workout_id]);
+            }
+            maybe_update_cardio_pr($db, $exercise_id, $duration, $distance, $hr_avg, $intensity);
+            $db->commit();
+        } catch (Throwable $e) {
+            $db->rollBack();
+            throw $e;
+        }
 
-        // Finish the workout
-        $db->prepare("UPDATE workouts SET finished_at = ?, bodyweight_kg = ? WHERE id = ? AND finished_at IS NULL")
-           ->execute([$now, $bodyweight, $workout_id]);
-        if ($bodyweight) set_user_setting($db, 'bodyweight_kg', (string)$bodyweight);
-
-        // Update cardio PRs
-        maybe_update_cardio_pr($db, $exercise_id, $duration, $distance, $hr_avg, $intensity);
-
+        forge_refresh_active_cycle($db, $workout_id);
         echo json_encode(['status' => 'success']);
 
     } elseif ($action === 'finish_workout') {
@@ -139,12 +222,19 @@ try {
         $notes      = $_POST['notes'] ?? null;
         $bodyweight = $_POST['bodyweight_kg'] ? (float)$_POST['bodyweight_kg'] : null;
 
-        $db->prepare("UPDATE workouts SET finished_at=?, notes=?, bodyweight_kg=? WHERE id=? AND finished_at IS NULL")
+        $db->beginTransaction();
+        try {
+        require_active_workout($db, $id);
+        $db->prepare("UPDATE workouts SET finished_at=?, notes=?, bodyweight_kg=? WHERE id=?")
            ->execute([date('Y-m-d H:i:s'), $notes, $bodyweight, $id]);
 
         // Cache bodyweight for future effective-weight calculations
         if ($bodyweight) {
             set_user_setting($db, 'bodyweight_kg', (string)$bodyweight);
+            $db->prepare("INSERT INTO bodyweight_measurements (measured_at, weight_kg, era_id, workout_id, source)
+                SELECT started_at, ?, era_id, id, 'workout' FROM workouts WHERE id = ?
+                ON CONFLICT DO NOTHING")
+               ->execute([$bodyweight, $id]);
         }
 
         // Commit PRs for all sets in this workout (strength + cardio)
@@ -179,7 +269,13 @@ try {
             $db->prepare("UPDATE templates SET last_ab_variant = ? WHERE id = ?")
                ->execute([$wk_row['ab_variant'], $wk_row['template_id']]);
         }
+        $db->commit();
+        } catch (Throwable $e) {
+            $db->rollBack();
+            throw $e;
+        }
 
+        forge_refresh_active_cycle($db, $id);
         echo json_encode(['status' => 'success']);
 
     } elseif ($action === 'update_workout') {
@@ -196,7 +292,17 @@ try {
     } elseif ($action === 'delete_workout') {
         $id = (int)($_POST['id'] ?? 0);
         if (!$id) throw new Exception('ID required');
-        $db->prepare("DELETE FROM workouts WHERE id=?")->execute([$id]);
+        $db->beginTransaction();
+        try {
+            $deleted = $db->prepare("DELETE FROM workouts WHERE id=?");
+            $deleted->execute([$id]);
+            if ($deleted->rowCount() === 0) throw new Exception('Workout not found');
+            rebuild_derived_records($db);
+            $db->commit();
+        } catch (Throwable $e) {
+            $db->rollBack();
+            throw $e;
+        }
         echo json_encode(['status' => 'success']);
 
     } elseif ($action === 'list_workouts') {
@@ -263,21 +369,29 @@ try {
             $exercises[$eid]['sets'][] = $s;
         }
 
-        // For each exercise, fetch previous session sets
-        foreach (array_keys($exercises) as $eid) {
+        // Fetch previous sets for every current exercise in one query. The old
+        // implementation made one history query per exercise (N+1).
+        if ($exercises) {
+            $exercise_ids = array_keys($exercises);
+            $placeholders = implode(',', array_fill(0, count($exercise_ids), '?'));
             $prev = $db->prepare("
-                SELECT ws.set_number, ws.weight_kg, ws.added_weight_kg, ws.reps, ws.rpe,
+                SELECT ws.exercise_id, ws.set_number, ws.weight_kg, ws.added_weight_kg, ws.reps, ws.rpe,
                        ws.set_type, ws.duration_sec, ws.distance_km, ws.hr_avg, ws.hr_max, ws.intensity
                 FROM workout_sets ws
                 JOIN workouts w ON w.id = ws.workout_id
-                WHERE ws.exercise_id = ?
+                WHERE ws.exercise_id IN ($placeholders)
                   AND w.finished_at IS NOT NULL
                   AND w.id != ?
-                ORDER BY w.finished_at DESC, ws.set_number ASC
-                LIMIT 20
+                ORDER BY ws.exercise_id ASC, w.finished_at DESC, ws.set_number ASC
             ");
-            $prev->execute([$eid, $workout_id]);
-            $exercises[$eid]['previous_sets'] = $prev->fetchAll(PDO::FETCH_ASSOC);
+            $prev->execute([...$exercise_ids, $workout_id]);
+            foreach ($prev->fetchAll(PDO::FETCH_ASSOC) as $set) {
+                $eid = (int)$set['exercise_id'];
+                if (count($exercises[$eid]['previous_sets']) < 20) {
+                    unset($set['exercise_id']);
+                    $exercises[$eid]['previous_sets'][] = $set;
+                }
+            }
         }
 
         echo json_encode(['status' => 'success', 'data' => array_values($exercises)]);
@@ -299,6 +413,14 @@ try {
         $notes       = $_POST['notes'] ?? null;
 
         if (!$workout_id || !$exercise_id) throw new Exception('workout_id and exercise_id required');
+        require_active_workout_exercise($db, $workout_id, $exercise_id);
+        if (!in_array($set_type, ['warmup', 'working', 'dropset', 'failure'], true)) throw new Exception('Invalid set type');
+        if ($set_number < 1) throw new Exception('Set number must be positive');
+        if ($weight_kg !== null && $weight_kg < 0) throw new Exception('Weight cannot be negative');
+        if ($rpe !== null && ($rpe < 1 || $rpe > 10)) throw new Exception('RPE must be between 1 and 10');
+        if ($duration !== null && $duration < 0) throw new Exception('Duration cannot be negative');
+        if ($distance !== null && $distance < 0) throw new Exception('Distance cannot be negative');
+        if ($intensity !== null && ($intensity < 1 || $intensity > 10)) throw new Exception('Intensity must be between 1 and 10');
 
         // Look up exercise type to handle BW effective-weight calculation
         $ex_info = $db->prepare("SELECT category, bw_factor FROM exercises WHERE id = ?");
@@ -399,6 +521,7 @@ try {
         $order_num   = (int)($_POST['order_num']   ?? 0);
         $target_sets = max(1, (int)($_POST['target_sets'] ?? 3));
         if (!$workout_id || !$exercise_id) throw new Exception('workout_id and exercise_id required');
+        require_active_workout($db, $workout_id);
         $db->prepare("
             INSERT INTO workout_exercises (workout_id, exercise_id, order_num, target_sets)
             VALUES (?, ?, ?, ?)
@@ -412,6 +535,7 @@ try {
         $exercise_id = (int)($_POST['exercise_id'] ?? 0);
         $target_sets = max(1, (int)($_POST['target_sets'] ?? 3));
         if (!$workout_id || !$exercise_id) throw new Exception('workout_id and exercise_id required');
+        require_active_workout_exercise($db, $workout_id, $exercise_id);
         $db->prepare("UPDATE workout_exercises SET target_sets=? WHERE workout_id=? AND exercise_id=?")
            ->execute([$target_sets, $workout_id, $exercise_id]);
         echo json_encode(['status' => 'success']);
@@ -420,6 +544,7 @@ try {
         $workout_id  = (int)($_POST['workout_id']  ?? 0);
         $exercise_id = (int)($_POST['exercise_id'] ?? 0);
         if (!$workout_id || !$exercise_id) throw new Exception('workout_id and exercise_id required');
+        require_active_workout_exercise($db, $workout_id, $exercise_id);
         $db->prepare("DELETE FROM workout_exercises WHERE workout_id=? AND exercise_id=?")
            ->execute([$workout_id, $exercise_id]);
         echo json_encode(['status' => 'success']);
@@ -428,6 +553,7 @@ try {
         $set_id    = (int)($_POST['set_id'] ?? 0);
         $workout_id = (int)($_POST['workout_id'] ?? 0);
         if (!$set_id) throw new Exception('set_id required');
+        require_active_workout($db, $workout_id);
         $db->prepare("DELETE FROM workout_sets WHERE id=? AND workout_id=?")->execute([$set_id, $workout_id]);
         echo json_encode(['status' => 'success']);
 
@@ -498,12 +624,7 @@ try {
     } elseif ($action === 'add_template_exercise') {
         $template_id  = (int)($_POST['template_id'] ?? 0);
         $exercise_id  = (int)($_POST['exercise_id'] ?? 0);
-        $sets         = $_POST['target_sets'] ? (int)$_POST['target_sets'] : null;
-        $reps_min     = $_POST['target_reps_min'] ? (int)$_POST['target_reps_min'] : null;
-        $reps_max     = $_POST['target_reps_max'] ? (int)$_POST['target_reps_max'] : null;
-        $rpe          = $_POST['target_rpe'] ? (float)$_POST['target_rpe'] : null;
-        $scheme       = $_POST['progression_scheme'] ?? 'double';
-        $increment    = $_POST['progression_increment_kg'] ? (float)$_POST['progression_increment_kg'] : 2.5;
+        [$sets, $reps_min, $reps_max, $rpe, $scheme, $increment] = validated_template_progression();
         if (!$template_id || !$exercise_id) throw new Exception('template_id and exercise_id required');
 
         // Append at end
@@ -517,12 +638,7 @@ try {
 
     } elseif ($action === 'update_template_exercise') {
         $id       = (int)($_POST['id'] ?? 0);
-        $sets     = $_POST['target_sets'] ? (int)$_POST['target_sets'] : null;
-        $reps_min = $_POST['target_reps_min'] ? (int)$_POST['target_reps_min'] : null;
-        $reps_max = $_POST['target_reps_max'] ? (int)$_POST['target_reps_max'] : null;
-        $rpe      = $_POST['target_rpe'] ? (float)$_POST['target_rpe'] : null;
-        $scheme   = $_POST['progression_scheme'] ?? 'double';
-        $increment = $_POST['progression_increment_kg'] ? (float)$_POST['progression_increment_kg'] : 2.5;
+        [$sets, $reps_min, $reps_max, $rpe, $scheme, $increment] = validated_template_progression();
         $ab_group = isset($_POST['ab_group']) && in_array($_POST['ab_group'], ['A', 'B']) ? $_POST['ab_group'] : null;
         if (!$id) throw new Exception('ID required');
 
@@ -544,15 +660,73 @@ try {
         $exercise_id = (int)($_POST['exercise_id'] ?? 0);
         $weight      = $_POST['weight'] ?? '';
         if (!$workout_id || !$exercise_id) throw new Exception('workout_id and exercise_id required');
+        require_active_workout_exercise($db, $workout_id, $exercise_id);
         $w = $weight === '' ? null : (float)$weight;
         $db->prepare("UPDATE workout_exercises SET progression_applied_weight=? WHERE workout_id=? AND exercise_id=?")
            ->execute([$w, $workout_id, $exercise_id]);
+        echo json_encode(['status' => 'success']);
+
+    } elseif ($action === 'get_exercise_completion') {
+        $workout_id = (int)($_POST['workout_id'] ?? 0);
+        $exercise_id = (int)($_POST['exercise_id'] ?? 0);
+        if (!$workout_id || !$exercise_id) throw new Exception('workout_id and exercise_id required');
+        require_active_workout_exercise($db, $workout_id, $exercise_id);
+        $config = $db->prepare("SELECT we.target_sets, te.target_reps_min, te.target_reps_max, te.progression_scheme, te.progression_increment_kg
+            FROM workout_exercises we JOIN workouts w ON w.id=we.workout_id
+            LEFT JOIN template_exercises te ON te.template_id=w.template_id AND te.exercise_id=we.exercise_id
+            WHERE we.workout_id=? AND we.exercise_id=?");
+        $config->execute([$workout_id, $exercise_id]); $config = $config->fetch(PDO::FETCH_ASSOC) ?: [];
+        $sets = $db->prepare("SELECT MIN(reps) min_reps, MAX(weight_kg) max_weight, MAX(added_weight_kg) max_added_weight, COUNT(*) set_count
+            FROM workout_sets WHERE workout_id=? AND exercise_id=? AND set_type='working'");
+        $sets->execute([$workout_id, $exercise_id]); $sets = $sets->fetch(PDO::FETCH_ASSOC) ?: [];
+        $scheme = $config['progression_scheme'] ?? null;
+        $target_sets = (int)($config['target_sets'] ?? 0);
+        $reps_min = (int)($config['target_reps_min'] ?? 0);
+        $reps_max = (int)($config['target_reps_max'] ?? $reps_min);
+        $increment = (float)($config['progression_increment_kg'] ?? 2.5);
+        $completed = (int)($sets['set_count'] ?? 0) >= $target_sets;
+        $top_hit = $completed && $reps_max > 0 && (int)($sets['min_reps'] ?? 0) >= $reps_max;
+        $base_weight = $sets['max_added_weight'] !== null ? (float)$sets['max_added_weight'] : (float)($sets['max_weight'] ?? 0);
+        $next_weight = $base_weight;
+        $message = 'Exercise complete — next target will be based on this session.';
+        $tone = 'complete';
+        if ($scheme === 'double') {
+            if ($top_hit) { $next_weight += $increment; $message = "All {$target_sets} sets hit {$reps_max} — add {$increment}kg next time."; $tone = 'progress'; }
+            else { $message = "Exercise complete — push for {$reps_max} reps on all {$target_sets} sets next time."; }
+        } elseif ($scheme === 'linear') {
+            if ($completed && $reps_min > 0 && (int)($sets['min_reps'] ?? 0) >= $reps_min) { $next_weight += $increment; $message = "Target hit — add {$increment}kg next time."; $tone = 'progress'; }
+            else { $message = "Exercise complete — repeat this weight and reach {$reps_min} reps."; }
+        }
+        echo json_encode(['status' => 'success', 'data' => ['message' => $message, 'tone' => $tone, 'next_weight' => round($next_weight, 1), 'is_bodyweight' => $sets['max_added_weight'] !== null]]);
+
+    } elseif ($action === 'replace_workout_exercise') {
+        $workout_id = (int)($_POST['workout_id'] ?? 0);
+        $from_id = (int)($_POST['from_exercise_id'] ?? 0);
+        $to_id = (int)($_POST['to_exercise_id'] ?? 0);
+        if (!$workout_id || !$from_id || !$to_id || $from_id === $to_id) throw new Exception('Valid replacement exercises required');
+        require_active_workout_exercise($db, $workout_id, $from_id);
+        $logged = $db->prepare('SELECT COUNT(*) FROM workout_sets WHERE workout_id=? AND exercise_id=?');
+        $logged->execute([$workout_id, $from_id]);
+        if ((int)$logged->fetchColumn() > 0) throw new Exception('Only an unstarted exercise can be replaced');
+        $exists = $db->prepare('SELECT 1 FROM workout_exercises WHERE workout_id=? AND exercise_id=?');
+        $exists->execute([$workout_id, $to_id]);
+        if ($exists->fetchColumn()) throw new Exception('That exercise is already in this workout');
+        $db->beginTransaction();
+        try {
+            $old = $db->prepare('SELECT order_num, target_sets FROM workout_exercises WHERE workout_id=? AND exercise_id=?');
+            $old->execute([$workout_id, $from_id]); $old = $old->fetch(PDO::FETCH_ASSOC);
+            $db->prepare('DELETE FROM workout_exercises WHERE workout_id=? AND exercise_id=?')->execute([$workout_id, $from_id]);
+            $db->prepare('INSERT INTO workout_exercises (workout_id, exercise_id, order_num, target_sets) VALUES (?,?,?,?)')
+                ->execute([$workout_id, $to_id, (int)$old['order_num'], (int)$old['target_sets']]);
+            $db->commit();
+        } catch (Throwable $e) { $db->rollBack(); throw $e; }
         echo json_encode(['status' => 'success']);
 
     } elseif ($action === 'reorder_workout_exercises') {
         $workout_id = (int)($_POST['workout_id'] ?? 0);
         $order = json_decode($_POST['order'] ?? '[]', true);
         if (!$workout_id || !is_array($order)) throw new Exception('workout_id and order required');
+        require_active_workout($db, $workout_id);
         $stmt = $db->prepare("UPDATE workout_exercises SET order_num=? WHERE workout_id=? AND exercise_id=?");
         foreach ($order as $i => $eid) {
             $stmt->execute([$i + 1, $workout_id, (int)$eid]);
@@ -607,6 +781,7 @@ try {
         $workout_id  = (int)($_POST['workout_id'] ?? 0);
         $samples_raw = $_POST['samples'] ?? '';
         if (!$workout_id) throw new Exception('workout_id required');
+        require_active_workout($db, $workout_id);
         $samples = json_decode($samples_raw, true);
         if (!is_array($samples) || empty($samples)) throw new Exception('samples must be a non-empty JSON array');
         $stmt = $db->prepare("INSERT INTO workout_hr_samples (workout_id, sampled_at, bpm) VALUES (?, ?, ?)");
@@ -638,7 +813,7 @@ try {
         echo json_encode(['status' => 'success']);
 
     } elseif ($action === 'get_last_exercise_sets') {
-        // Previous working sets for one exercise from the most recent finished workout
+        // Previous working and drop sets from the most recent finished workout.
         $exercise_id = (int)($_POST['exercise_id'] ?? 0);
         $workout_id  = (int)($_POST['workout_id'] ?? 0); // current workout to exclude
         if (!$exercise_id) throw new Exception('exercise_id required');
@@ -648,18 +823,24 @@ try {
                    ws.set_type, ws.duration_sec, ws.distance_km, ws.hr_avg, ws.hr_max, ws.intensity
             FROM workout_sets ws
             WHERE ws.exercise_id = ?
-              AND ws.set_type = 'working'
+              AND ws.set_type IN ('working', 'dropset')
               AND ws.workout_id = (
                   SELECT w2.id FROM workouts w2
                   JOIN workout_sets ws2 ON ws2.workout_id = w2.id
                   WHERE ws2.exercise_id = ? AND w2.finished_at IS NOT NULL
                     AND (? = 0 OR w2.id != ?)
+                    AND w2.era_id = ?
                   ORDER BY w2.finished_at DESC LIMIT 1
               )
             ORDER BY ws.set_number ASC
         ");
-        $stmt->execute([$exercise_id, $exercise_id, $workout_id, $workout_id]);
-        echo json_encode(['status' => 'success', 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+        $stmt->execute([$exercise_id, $exercise_id, $workout_id, $workout_id, $active_era_id]);
+        $previous_sets = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        echo json_encode([
+            'status' => 'success',
+            'data' => array_values(array_filter($previous_sets, fn($set) => $set['set_type'] === 'working')),
+            'drop_sets' => array_values(array_filter($previous_sets, fn($set) => $set['set_type'] === 'dropset')),
+        ]);
 
     } else {
         throw new Exception('Unknown action: ' . htmlspecialchars($action));

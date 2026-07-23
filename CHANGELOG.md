@@ -2,6 +2,35 @@
 
 All notable changes to FORGE are documented here.
 
+## v0.5.0 — 2026-07-23
+
+### Added
+- **Training eras and cycle analytics** — automatically classify training history into bulk, cut, recomposition, and detraining cycles. History now has a dedicated Cycles view with expandable cycle detail, mobile-safe comparison, bodyweight/BF%/estimated lean-mass metrics, training dose, Big Four e1RM movement, and relative-strength context.
+- **Reviewable cycle reanalysis** — History → Cycles provides a dry-run reanalysis control. It shows the saved cycles that would be replaced and the chronological proposal before an explicit Apply confirmation. Applying is guarded against data changing after preview.
+- **Cycle-scoped Progress and History** — select all time, era, or cycle context; use the Progress date scrubber to inspect a true point-in-time snapshot. Workout calendars and volume charts adapt their time scale to the selected range.
+- **Point-in-time strength comparison** on full exercise history: compare e1RM, bodyweight, estimated lean mass, e1RM/BW, and e1RM/LBM, with similarly strong sessions suggested from prior cycles.
+- **Post-exercise completion panel** — completing an exercise’s working-set target replaces the live progression hint with an achieved/repeat/increase result for the next session.
+- **In-workout exercise substitution** — replace an unstarted exercise directly from its card header, reusing the exercise picker and the replacement exercise’s previous-session data.
+- **Strong archive tooling** — import, repair, and bodyweight/BF% seeding scripts for bringing legacy Strong training data into Forge while retaining eras and cycle analysis.
+- Lightweight SQLite-backed regression coverage for database helpers, active-cycle refresh, service-worker wiring, and shared workout modules.
+
+### Changed
+- Progress, History, and exercise analysis now share cycle/bodyweight/body-fat interpolation logic, so bodyweight and estimated lean mass use the full available data rather than snapping to isolated measurements.
+- Current live cycles extend as both strength and cardio workouts finish. Reanalysis preserves an unchanged active cycle’s live endpoint instead of shrinking it to the last bodyweight data point.
+- Dashboard suggested-workout rotation ignores templates unused for more than 21 days, allowing deprecated templates to remain archived without blocking active suggestions.
+- Workout logger, rest alerts, HR monitor, cardio session, session clock, warmups, and API client are split into focused shared modules.
+
+### Fixed
+- Drop sets now retain their prior-session values reliably.
+- Stale active workouts are cleaned up safely instead of resuming with multi-day timers.
+- Bodyweight exercises imported from Strong correctly use Forge effective-load calculations rather than treating zero added weight as zero total load.
+- Selected-cycle history calendar/volume data, cycle selector persistence, and all-time calendar scaling are corrected.
+- Foreground rest alerts use bell/vibration without unnecessary system notifications; background notification handling is more resilient.
+- Bodyweight and body-fat displays are consistently rounded for readable comparisons.
+
+### Schema
+- Added training eras/cycles, bodyweight measurements, body-measurement source support, workout-era attribution, bodyweight-exercise coefficients, and progression/drop-set support columns. Existing installations migrate automatically.
+
 ## v0.4.0 — 2026-04-16
 
 ### Added

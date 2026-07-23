@@ -1,14 +1,66 @@
 <?php
 require_once __DIR__ . '/../core/auth.php';
 require_once __DIR__ . '/../core/db_helper.php';
+require_once __DIR__ . '/../core/cycle_analysis.php';
 
 $db   = get_db_connection();
 $unit = 'kg';
+$active_era_id = active_training_era_id($db);
+$cycles = $db->query("SELECT c.*, e.name AS era_name FROM training_cycles c JOIN training_eras e ON e.id = c.era_id ORDER BY c.starts_at DESC")->fetchAll(PDO::FETCH_ASSOC);
+$cycle_context = (string)($_GET['cycle'] ?? 'current');
+$cycle_context_request = $cycle_context;
+$requested_section = (string)($_GET['section'] ?? 'strength');
+$progress_section = in_array($requested_section, ['strength', 'cardio', 'body'], true) ? $requested_section : 'strength';
+$active_cycle = null;
+foreach ($cycles as $cycle) if ((int)$cycle['era_id'] === $active_era_id) { $active_cycle = $cycle; break; }
+$selected_cycle = null;
+if ($cycle_context === 'current') {
+    $selected_cycle = $active_cycle;
+} elseif (ctype_digit($cycle_context)) {
+    foreach ($cycles as $cycle) if ((int)$cycle['id'] === (int)$cycle_context) { $selected_cycle = $cycle; break; }
+}
+$scope_label = 'All time'; $scope_clause = ''; $scope_params = [];
+if ($selected_cycle) {
+    $scope_label = forge_cycle_label($selected_cycle['cycle_type']) . ' · ' . date('M Y', strtotime($selected_cycle['starts_at'])) . '–' . date('M Y', strtotime($selected_cycle['ends_at']));
+    $scope_clause = ' AND w.era_id = ? AND w.started_at >= ? AND w.started_at <= ?';
+    $scope_params = [(int)$selected_cycle['era_id'], $selected_cycle['starts_at'], $selected_cycle['ends_at']];
+    $cycle_context = (string)$selected_cycle['id'];
+} elseif ($cycle_context === 'era') {
+    $scope_label = 'Current era'; $scope_clause = ' AND w.era_id = ?'; $scope_params = [$active_era_id];
+} elseif ($cycle_context !== 'all') {
+    $cycle_context = 'all';
+}
+
+$scope_start_at = $selected_cycle['starts_at'] ?? null;
+$scope_end_at = $selected_cycle['ends_at'] ?? ($cycle_context === 'era' ? date('Y-m-d H:i:s') : null);
+$scrub_dates = [];
+if ($selected_cycle) {
+    $scrub_stmt = $db->prepare('SELECT DISTINCT DATE(started_at) AS date FROM workouts WHERE era_id=? AND finished_at IS NOT NULL AND started_at>=? AND started_at<=? ORDER BY started_at');
+    $scrub_stmt->execute([(int)$selected_cycle['era_id'], $selected_cycle['starts_at'], $selected_cycle['ends_at']]);
+    $scrub_dates = $scrub_stmt->fetchAll(PDO::FETCH_COLUMN);
+}
+$requested_as_of = (string)($_GET['as_of'] ?? '');
+$as_of_at = null;
+if ($scope_end_at && $requested_as_of !== '') {
+    $candidate = strtotime($requested_as_of . ' 23:59:59');
+    if ($candidate !== false) $as_of_at = date('Y-m-d H:i:s', min(strtotime($scope_end_at), max(strtotime((string)$scope_start_at), $candidate)));
+}
+$scrub_index = max(0, count($scrub_dates) - 1);
+if ($scrub_dates && $requested_as_of !== '') {
+    foreach ($scrub_dates as $i => $date) if (strtotime($date) <= strtotime($requested_as_of)) $scrub_index = $i;
+}
+if ($as_of_at) {
+    $scope_clause = ' AND w.era_id = ?' . ($scope_start_at ? ' AND w.started_at >= ?' : '') . ' AND w.started_at <= ?';
+    $scope_params = $scope_start_at ? [(int)$selected_cycle['era_id'], $scope_start_at, $as_of_at] : [$active_era_id, $as_of_at];
+}
 
 // ── BODYWEIGHT (most recent logged, default 80 kg) ─────────────────────────
-$bw = (float)($db->query(
-    "SELECT bodyweight_kg FROM workouts WHERE bodyweight_kg IS NOT NULL AND bodyweight_kg > 0 ORDER BY started_at DESC LIMIT 1"
-)->fetchColumn() ?: 80.0);
+if ($selected_cycle) {
+    $bw = (float)(forge_cycle_bodyweight($db, (int)$selected_cycle['era_id'], $as_of_at ?: $selected_cycle['ends_at']) ?: 80.0);
+} else {
+    $bw_stmt = $db->prepare("SELECT bodyweight_kg FROM workouts w WHERE bodyweight_kg IS NOT NULL AND bodyweight_kg > 0{$scope_clause} ORDER BY started_at DESC LIMIT 1");
+    $bw_stmt->execute($scope_params); $bw = (float)($bw_stmt->fetchColumn() ?: 80.0);
+}
 
 // ── PROFILE DATA ──────────────────────────────────────────────────────────────
 $profile_sex   = get_user_setting($db, 'profile_sex', 'M');
@@ -60,9 +112,8 @@ foreach ($big4_def as $key => $def) {
     $eid    = $ex_id_map[$def['name']] ?? null;
     $pr     = 0.0;
     if ($eid) {
-        $pr_stmt = $db->prepare("SELECT estimated_1rm FROM personal_records WHERE exercise_id = ? ORDER BY estimated_1rm DESC LIMIT 1");
-        $pr_stmt->execute([$eid]);
-        $pr = (float)($pr_stmt->fetchColumn() ?: 0);
+        $pr_stmt = $db->prepare("SELECT ws.weight_kg * (1 + ws.reps / 30.0) FROM workout_sets ws JOIN workouts w ON w.id = ws.workout_id WHERE ws.exercise_id = ? AND ws.set_type = 'working' AND ws.reps BETWEEN 1 AND 30 AND ws.weight_kg > 0 AND w.finished_at IS NOT NULL{$scope_clause} ORDER BY w.started_at DESC, ws.id DESC LIMIT 1");
+        $pr_stmt->execute([$eid, ...$scope_params]); $pr = (float)($pr_stmt->fetchColumn() ?: 0);
     }
     $big4[$key] = ['name' => $def['name'], 'exercise_id' => $eid, 'scaled' => $scaled, 'current_1rm' => round($pr, 1)];
 }
@@ -77,23 +128,12 @@ foreach ($big4 as $key => $lift) {
 }
 
 // ── PR BOARD ───────────────────────────────────────────────────────────────
-$pr_board = $db->query("
-    SELECT pr.exercise_id, pr.weight_kg, pr.reps, ROUND(pr.estimated_1rm, 1) as estimated_1rm,
-           e.name as exercise_name, e.muscle_primary, e.category,
-           (SELECT COUNT(*) FROM personal_records p3
-            WHERE p3.exercise_id = e.id) as pr_count,
-           (SELECT MAX(achieved_at) FROM personal_records p4
-            WHERE p4.exercise_id = e.id) as last_pr_at
-    FROM personal_records pr
-    JOIN exercises e ON e.id = pr.exercise_id
-    WHERE pr.id = (
-        SELECT id FROM personal_records p2
-        WHERE p2.exercise_id = pr.exercise_id
-        ORDER BY p2.estimated_1rm DESC LIMIT 1
-    )
-    AND pr.estimated_1rm > 0
-    ORDER BY pr_count DESC, last_pr_at DESC
-")->fetchAll(PDO::FETCH_ASSOC);
+$pr_board_stmt = $db->prepare("SELECT ws.exercise_id, ROUND(MAX(ws.weight_kg * (1 + ws.reps / 30.0)), 1) AS estimated_1rm,
+    e.name AS exercise_name, e.muscle_primary, e.category, COUNT(DISTINCT w.id) AS pr_count, MAX(w.started_at) AS last_pr_at
+    FROM workout_sets ws JOIN workouts w ON w.id = ws.workout_id JOIN exercises e ON e.id = ws.exercise_id
+    WHERE ws.set_type = 'working' AND ws.reps BETWEEN 1 AND 30 AND ws.weight_kg > 0 AND w.finished_at IS NOT NULL{$scope_clause}
+    GROUP BY ws.exercise_id ORDER BY pr_count DESC, estimated_1rm DESC");
+$pr_board_stmt->execute($scope_params); $pr_board = $pr_board_stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // ── CARDIO PRs ─────────────────────────────────────────────────────────────
 $cardio_raw = $db->query("
@@ -117,28 +157,37 @@ foreach ($cardio_raw as $r) {
 }
 
 // ── CARDIO TOTALS ──────────────────────────────────────────────────────────
-$ctotals = $db->query("
+$ctotals_sql = "
     SELECT ROUND(SUM(COALESCE(ws.distance_km, 0)), 1) as total_km,
            SUM(COALESCE(ws.duration_sec, 0)) as total_sec,
            COUNT(DISTINCT ws.workout_id) as sessions
     FROM workout_sets ws
     JOIN workouts w ON w.id = ws.workout_id
     JOIN exercises e ON e.id = ws.exercise_id
-    WHERE w.finished_at IS NOT NULL AND e.category = 'Cardio'
-")->fetch(PDO::FETCH_ASSOC) ?: ['total_km' => 0, 'total_sec' => 0, 'sessions' => 0];
+    WHERE w.finished_at IS NOT NULL AND e.category = 'Cardio'{$scope_clause}";
+$ctotals_stmt = $db->prepare($ctotals_sql); $ctotals_stmt->execute($scope_params);
+$ctotals = $ctotals_stmt->fetch(PDO::FETCH_ASSOC) ?: ['total_km' => 0, 'total_sec' => 0, 'sessions' => 0];
 $total_hrs = $ctotals['total_sec'] > 0 ? round($ctotals['total_sec'] / 3600, 1) : 0;
 
 // ── BODY DATA ─────────────────────────────────────────────────────────────────
-$body_measurements = $db->query("
+$body_scope = $selected_cycle ? ' AND measured_at >= ? AND measured_at <= ?' : '';
+$body_scope_params = $selected_cycle ? [$selected_cycle['starts_at'], $as_of_at ?: $selected_cycle['ends_at']] : [];
+$body_era_clause = $cycle_context === 'all' ? '' : ' AND era_id = ?';
+$body_era_params = $cycle_context === 'all' ? [] : [$selected_cycle ? (int)$selected_cycle['era_id'] : $active_era_id];
+$body_stmt = $db->prepare("
     SELECT id, measured_at, waist_cm, neck_cm, hip_cm, caliper_bf_pct
-    FROM body_measurements ORDER BY measured_at DESC LIMIT 10
-")->fetchAll(PDO::FETCH_ASSOC);
+    FROM body_measurements WHERE 1 = 1{$body_era_clause}{$body_scope} ORDER BY measured_at DESC LIMIT 10
+");
+$body_stmt->execute([...$body_era_params, ...$body_scope_params]);
+$body_measurements = $body_stmt->fetchAll(PDO::FETCH_ASSOC);
 
 $latest_meas = $body_measurements[0] ?? null;
 
 // Navy BF% from latest measurement
 $navy_bf    = null;
-$caliper_bf = $latest_meas ? (float)($latest_meas['caliper_bf_pct'] ?: 0) ?: null : null;
+$caliper_bf = $selected_cycle
+    ? forge_cycle_bodyfat($db, (int)$selected_cycle['era_id'], $as_of_at ?: $selected_cycle['ends_at'])
+    : ($latest_meas ? (float)($latest_meas['caliper_bf_pct'] ?: 0) ?: null : null);
 if ($latest_meas && $height_cm > 0 && $latest_meas['waist_cm'] && $latest_meas['neck_cm']) {
     if ($is_female && $latest_meas['hip_cm']) {
         $navy_bf = round(163.205 * log10((float)$latest_meas['waist_cm'] + (float)$latest_meas['hip_cm'] - (float)$latest_meas['neck_cm']) - 97.684 * log10($height_cm) - 78.387, 1);
@@ -154,19 +203,25 @@ $bmi         = ($height_cm > 0 && $bw > 0) ? round($bw / pow($height_cm / 100, 2
 $whr         = ($height_cm > 0 && $latest_meas && $latest_meas['waist_cm']) ? round((float)$latest_meas['waist_cm'] / $height_cm, 3) : null;
 
 // Bodyweight trend (last 180 days — one point per workout)
-$bw_trend = $db->query("
+$bw_date_clause = ($selected_cycle || $cycle_context === 'all') ? '' : " AND started_at >= date('now', '-180 days')";
+$workout_body_scope = $selected_cycle ? ' AND started_at >= ? AND started_at <= ?' : '';
+$bw_stmt = $db->prepare("
     SELECT DATE(started_at) as date, ROUND(bodyweight_kg, 1) as bw
     FROM workouts
     WHERE bodyweight_kg IS NOT NULL AND bodyweight_kg > 0
-      AND started_at >= date('now', '-180 days')
+      {$body_era_clause}{$workout_body_scope}{$bw_date_clause}
     ORDER BY started_at
-")->fetchAll(PDO::FETCH_ASSOC);
+");
+$bw_stmt->execute([...$body_era_params, ...$body_scope_params]);
+$bw_trend = $bw_stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // BF% trend (chronological for chart)
-$bf_trend_raw = $db->query("
+$bf_stmt = $db->prepare("
     SELECT DATE(measured_at) as date, waist_cm, neck_cm, hip_cm, caliper_bf_pct
-    FROM body_measurements ORDER BY measured_at ASC
-")->fetchAll(PDO::FETCH_ASSOC);
+    FROM body_measurements WHERE 1 = 1{$body_era_clause}{$body_scope} ORDER BY measured_at ASC
+");
+$bf_stmt->execute([...$body_era_params, ...$body_scope_params]);
+$bf_trend_raw = $bf_stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Pre-compute BF% for each measurement for chart
 $bf_trend = [];
@@ -182,6 +237,53 @@ foreach ($bf_trend_raw as $row) {
     $c = $row['caliper_bf_pct'] ? (float)$row['caliper_bf_pct'] : null;
     $vs = array_filter([$n, $c], fn($v) => $v !== null);
     $bf_trend[] = ['date' => $row['date'], 'navy' => $n, 'caliper' => $c, 'smoothed' => count($vs) ? round(array_sum($vs)/count($vs),1) : null];
+}
+// Preserve a meaningful BF line even when the selected cycle sits between two
+// measurements: interpolation is based on the complete era, not clipped data.
+if ($selected_cycle) {
+    foreach ([$selected_cycle['starts_at'], $as_of_at ?: $selected_cycle['ends_at']] as $boundary) {
+        $bf = forge_cycle_bodyfat($db, (int)$selected_cycle['era_id'], $boundary);
+        if ($bf !== null) $bf_trend[] = ['date' => date('Y-m-d', strtotime($boundary)), 'navy' => null, 'caliper' => $bf, 'smoothed' => $bf];
+    }
+    usort($bf_trend, fn($a, $b) => strcmp($a['date'], $b['date']));
+}
+
+// Estimate BF% at every bodyweight entry by linearly interpolating between
+// measurements. Before the first and after the last measurement, retain the
+// nearest value so recording a new BF% cannot create an artificial step change.
+$bf_anchors = array_values(array_filter($bf_trend, fn($row) => $row['smoothed'] !== null));
+$lbm_trend = [];
+if ($bf_anchors) {
+    foreach ($bw_trend as $weight_row) {
+        $date_ts = strtotime($weight_row['date']);
+        $before = null;
+        $after = null;
+        foreach ($bf_anchors as $anchor) {
+            $anchor_ts = strtotime($anchor['date']);
+            if ($anchor_ts <= $date_ts) $before = $anchor;
+            if ($anchor_ts >= $date_ts) {
+                $after = $anchor;
+                break;
+            }
+        }
+
+        if ($before === null) {
+            $estimated_bf = (float)$bf_anchors[0]['smoothed'];
+        } elseif ($after === null) {
+            $estimated_bf = (float)$bf_anchors[count($bf_anchors) - 1]['smoothed'];
+        } else {
+            $before_ts = strtotime($before['date']);
+            $after_ts = strtotime($after['date']);
+            $fraction = $after_ts === $before_ts ? 0 : ($date_ts - $before_ts) / ($after_ts - $before_ts);
+            $estimated_bf = (float)$before['smoothed'] + $fraction * ((float)$after['smoothed'] - (float)$before['smoothed']);
+        }
+
+        $lbm_trend[] = [
+            'date' => $weight_row['date'],
+            'lbm' => round((float)$weight_row['bw'] * (1 - $estimated_bf / 100), 1),
+            'bf_pct' => round($estimated_bf, 1),
+        ];
+    }
 }
 
 // ── STRENGTH RATIOS ────────────────────────────────────────────────────────
@@ -219,7 +321,7 @@ function standards_card(array $lift, array $level_names, string $unit): string {
     if ($lv < 0 && $current > 0) {
         $badge = "<span class='std-badge' style='background:#37474f;color:#90a4ae;'>Below Untrained</span>";
     } elseif ($lv < 0) {
-        $badge = "<span class='std-badge' style='background:#1a1a1a;color:#444;'>No Data</span>";
+        $badge = "<span class='std-badge' style='background:#1a1a1a;color:#888;'>No Data</span>";
     } elseif ($lv < 2) {
         $badge = "<span class='std-badge' style='background:#1a2a37;color:#64b5f6;'>{$level_names[$lv]}</span>";
     } elseif ($lv < 4) {
@@ -244,8 +346,8 @@ function standards_card(array $lift, array $level_names, string $unit): string {
     for ($i = 0; $i < 6; $i++) {
         $pct   = round($levels[$i] / $max * 100, 2);
         $abbr  = strtoupper(substr($level_names[$i], 0, 3));
-        $col   = ($i === $lv && $current > 0) ? '#FF5722' : '#3a3a3a';
-        $wcol  = ($i === $lv && $current > 0) ? '#FF5722' : '#2a2a2a';
+        $col   = ($i === $lv && $current > 0) ? '#FF5722' : '#888';
+        $wcol  = ($i === $lv && $current > 0) ? '#FF5722' : '#888';
         $ticks .= "<div style='position:absolute;left:{$pct}%;top:0;height:100%;width:1px;background:#0a0a0a;'></div>";
         $lbls  .= "<div style='position:absolute;left:{$pct}%;transform:translateX(-50%);text-align:center;font-size:0.52rem;font-weight:700;color:{$col};line-height:1.3;white-space:nowrap;'>
             <div>{$abbr}</div><div style='color:{$wcol};'>{$levels[$i]}</div></div>";
@@ -264,8 +366,8 @@ function standards_card(array $lift, array $level_names, string $unit): string {
     $link = $lift['exercise_id'] ? "href='/forge/exercises/?id={$lift['exercise_id']}'" : '';
 
     return "
-    <div class='card mb-3'>
-        <div class='card-body py-3 px-3'>
+    <div class='card standards-card mb-2'>
+        <div class='card-body py-2 px-3'>
             <div class='d-flex justify-content-between align-items-center mb-1'>
                 <a {$link} class='fw-black text-decoration-none' style='font-size:0.88rem;color:#e0e0e0;letter-spacing:-0.3px;'>{$lift['name']}</a>
                 {$badge}
@@ -295,17 +397,28 @@ function standards_card(array $lift, array $level_names, string $unit): string {
     </div>
 
     <!-- Segmented toggle -->
-    <div class="d-flex mb-4" style="background:#111;border-radius:8px;padding:3px;gap:3px;">
-        <button id="btn-strength" class="seg-btn active flex-fill" onclick="showSection('strength')">
+    <div class="d-flex mb-3" style="background:#111;border-radius:8px;padding:3px;gap:3px;">
+        <button type="button" id="btn-strength" class="seg-btn<?= $progress_section === 'strength' ? ' active' : '' ?> flex-fill" onclick="showSection('strength')">
             <i class="bi bi-bar-chart-fill me-1"></i>STRENGTH
         </button>
-        <button id="btn-cardio" class="seg-btn flex-fill" onclick="showSection('cardio')">
+        <button type="button" id="btn-cardio" class="seg-btn<?= $progress_section === 'cardio' ? ' active' : '' ?> flex-fill" onclick="showSection('cardio')">
             <i class="bi bi-heart-pulse me-1"></i>CARDIO
         </button>
-        <button id="btn-body" class="seg-btn flex-fill" onclick="showSection('body')">
+        <button type="button" id="btn-body" class="seg-btn<?= $progress_section === 'body' ? ' active' : '' ?> flex-fill" onclick="showSection('body')">
             <i class="bi bi-person-arms-up me-1"></i>BODY
         </button>
     </div>
+
+    <form method="get" class="mb-3">
+        <input id="progress-section-field" type="hidden" name="section" value="<?= $progress_section ?>">
+        <select aria-label="Viewing period" name="cycle" onchange="this.form.submit()" style="width:100%;background:#1e1e1e;color:#e0e0e0;border:1px solid #444;border-radius:5px;padding:9px;font-size:.78rem;min-height:44px;">
+            <option value="current"<?= $cycle_context_request === 'current' ? ' selected' : '' ?>>CURRENT CYCLE<?= $active_cycle ? ' · ' . forge_cycle_label($active_cycle['cycle_type']) . ' · ' . date('M Y',strtotime($active_cycle['starts_at'])) . '–' . date('M Y',strtotime($active_cycle['ends_at'])) : '' ?></option>
+            <option value="era"<?= $cycle_context === 'era' ? ' selected' : '' ?>>CURRENT ERA</option>
+            <option value="all"<?= $cycle_context === 'all' ? ' selected' : '' ?>>ALL TIME</option>
+            <?php foreach ($cycles as $cycle): ?><option value="<?= $cycle['id'] ?>"<?= $cycle_context_request !== 'current' && $cycle_context === (string)$cycle['id'] ? ' selected' : '' ?>><?= forge_cycle_label($cycle['cycle_type']) ?> · <?= date('M Y',strtotime($cycle['starts_at'])) ?>–<?= date('M Y',strtotime($cycle['ends_at'])) ?></option><?php endforeach; ?>
+        </select>
+        <?php if ($scrub_dates): ?><input id="progress-as-of" type="hidden" name="as_of" value="<?= htmlspecialchars($scrub_dates[$scrub_index]) ?>"><div class="mt-2"><input id="progress-date-scrubber" type="range" min="0" max="<?= count($scrub_dates) - 1 ?>" value="<?= $scrub_index ?>" oninput="updateProgressScrubber(this.value)" onchange="this.form.submit()" style="width:100%;accent-color:#FF5722;"><output id="progress-scrubber-label" class="text-muted" style="font-size:.7rem;"><?= date('j M Y', strtotime($scrub_dates[$scrub_index])) ?></output></div><?php endif; ?>
+    </form>
 
     <!-- ═══════════════════════════════════════════════════════════ STRENGTH -->
     <div id="sec-strength">
@@ -329,8 +442,14 @@ function standards_card(array $lift, array $level_names, string $unit): string {
         <?php endforeach; ?>
         </div>
 
-        <!-- Big 4 1RM Trend -->
-        <div class="stat-label mb-2 mt-1">BIG 4 — 1RM TREND</div>
+        <!-- Big 4 trend -->
+        <div class="d-flex align-items-center justify-content-between mb-2 mt-1">
+            <div class="stat-label">BIG 4 — e1RM TREND</div>
+            <div style="background:#111;border-radius:5px;padding:2px;display:flex;gap:2px;">
+                <button id="big4-session-btn" class="seg-btn active" onclick="setBig4TrendMode('session')" style="padding:3px 7px;font-size:0.58rem;min-height:26px;border-radius:3px;">SESSION</button>
+                <button id="big4-pr-btn" class="seg-btn" onclick="setBig4TrendMode('pr')" style="padding:3px 7px;font-size:0.58rem;min-height:26px;border-radius:3px;">RUNNING PR</button>
+            </div>
+        </div>
         <div class="card mb-3">
             <div class="card-body py-3 px-3">
                 <div style="height:200px;">
@@ -342,7 +461,7 @@ function standards_card(array $lift, array $level_names, string $unit): string {
 
         <!-- PR Board -->
         <div class="d-flex align-items-center justify-content-between mb-2 mt-1">
-            <div class="stat-label">ALL-TIME PRs</div>
+            <div class="stat-label"><?= $cycle_context === 'all' ? 'ALL-TIME PRs' : 'BEST LIFTS IN VIEW' ?></div>
         </div>
         <?php if (empty($pr_board)): ?>
         <div class="card mb-3">
@@ -358,10 +477,7 @@ function standards_card(array $lift, array $level_names, string $unit): string {
                 <div class="flex-grow-1 min-w-0">
                     <div style="font-weight:700;font-size:0.85rem;color:#e0e0e0;"><?= htmlspecialchars($pr['exercise_name']) ?></div>
                     <div style="font-size:0.68rem;color:#555;">
-                        <?php if ($pr['weight_kg'] && $pr['reps']): ?>
-                        <?= round($pr['weight_kg'],1) ?> <?= $unit ?> × <?= $pr['reps'] ?> reps &nbsp;·&nbsp;
-                        <?php endif; ?>
-                        <?= $pr['pr_count'] ?> PR<?= $pr['pr_count'] != 1 ? 's' : '' ?> logged
+                        Best logged result in this view &nbsp;·&nbsp; <?= $pr['pr_count'] ?> session<?= $pr['pr_count'] != 1 ? 's' : '' ?>
                     </div>
                 </div>
                 <?php if ($pr['muscle_primary']): ?>
@@ -570,14 +686,14 @@ function standards_card(array $lift, array $level_names, string $unit): string {
                 <div class="card text-center py-3">
                     <div style="font-size:1.4rem;font-weight:900;color:#FF5722;"><?= $smoothed_bf !== null ? $smoothed_bf . '%' : '—' ?></div>
                     <div class="stat-label" style="font-size:0.55rem;">BODY FAT</div>
-                    <div style="font-size:0.6rem;color:#555;">smoothed</div>
+                    <div style="font-size:0.6rem;color:#888;">smoothed</div>
                 </div>
             </div>
             <div class="col-4">
                 <div class="card text-center py-3">
                     <div style="font-size:1.4rem;font-weight:900;color:#FF5722;"><?= $lean_mass !== null ? $lean_mass : '—' ?></div>
                     <div class="stat-label" style="font-size:0.55rem;">LEAN MASS</div>
-                    <div style="font-size:0.6rem;color:#555;"><?= $unit ?></div>
+                    <div style="font-size:0.6rem;color:#888;"><?= $unit ?></div>
                 </div>
             </div>
         </div>
@@ -592,6 +708,19 @@ function standards_card(array $lift, array $level_names, string $unit): string {
                 <div id="bw-empty" class="text-muted text-center py-3 d-none" style="font-size:0.8rem;">Log bodyweight at your next workout to start tracking</div>
             </div>
         </div>
+
+        <!-- Estimated lean body mass trend -->
+        <?php if (count($lbm_trend) > 0): ?>
+        <div class="stat-label mb-2">ESTIMATED LEAN MASS</div>
+        <div class="card mb-3">
+            <div class="card-body py-3 px-3">
+                <div style="height:180px;">
+                    <canvas id="lbm-chart"></canvas>
+                </div>
+                <div class="text-muted mt-2" style="font-size:0.68rem;">Body-fat percentage is interpolated between measurements.</div>
+            </div>
+        </div>
+        <?php endif; ?>
 
         <!-- Body composition breakdown -->
         <?php if ($smoothed_bf !== null && $lean_mass !== null): ?>
@@ -611,18 +740,18 @@ function standards_card(array $lift, array $level_names, string $unit): string {
                     <?php if ($navy_bf !== null): ?>
                     <div class="col-4 text-center">
                         <div style="font-size:0.9rem;font-weight:900;color:#FF5722;"><?= $navy_bf ?>%</div>
-                        <div style="font-size:0.6rem;color:#555;">NAVY</div>
+                        <div style="font-size:0.6rem;color:#888;">NAVY</div>
                     </div>
                     <?php endif; ?>
                     <?php if ($caliper_bf !== null): ?>
                     <div class="col-4 text-center">
                         <div style="font-size:0.9rem;font-weight:900;color:#FF5722;"><?= $caliper_bf ?>%</div>
-                        <div style="font-size:0.6rem;color:#555;">CALIPER</div>
+                        <div style="font-size:0.6rem;color:#888;">CALIPER</div>
                     </div>
                     <?php endif; ?>
                     <div class="col-4 text-center">
                         <div style="font-size:0.9rem;font-weight:900;color:#FF5722;"><?= $smoothed_bf ?>%</div>
-                        <div style="font-size:0.6rem;color:#555;">SMOOTHED</div>
+                        <div style="font-size:0.6rem;color:#888;">SMOOTHED</div>
                     </div>
                 </div>
             </div>
@@ -726,24 +855,6 @@ function standards_card(array $lift, array $level_names, string $unit): string {
 </div>
 
 <style>
-.seg-btn {
-    background: transparent;
-    border: none;
-    color: #555;
-    font-size: 0.75rem;
-    font-weight: 900;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    padding: 9px 12px;
-    border-radius: 6px;
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-    min-height: 44px;
-}
-.seg-btn.active {
-    background: #FF5722;
-    color: #fff;
-}
 .std-badge {
     font-size: 0.6rem;
     font-weight: 900;
@@ -757,10 +868,22 @@ function standards_card(array $lift, array $level_names, string $unit): string {
 
 <script>
 const PROGRESS_API = '/forge/core/progress_api.php';
+const PROGRESS_CYCLE_CONTEXT = <?= json_encode($cycle_context_request) ?>;
+const PROGRESS_AS_OF = <?= json_encode($as_of_at) ?>;
+const PROGRESS_SCRUB_DATES = <?= json_encode(array_values($scrub_dates)) ?>;
+
+function updateProgressScrubber(index) {
+    const date = PROGRESS_SCRUB_DATES[Number(index)];
+    if (!date) return;
+    document.getElementById('progress-as-of').value = date;
+    document.getElementById('progress-scrubber-label').value = new Date(date + 'T00:00:00').toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+}
 
 async function papi(action, data = {}) {
     const fd = new FormData();
     fd.append('action', action);
+    fd.append('cycle_context', PROGRESS_CYCLE_CONTEXT);
+    if (PROGRESS_AS_OF) fd.append('as_of', PROGRESS_AS_OF);
     for (const [k, v] of Object.entries(data)) fd.append(k, v);
     const r = await fetch(PROGRESS_API, { method: 'POST', body: fd });
     return r.json();
@@ -779,6 +902,8 @@ function showSection(sec) {
     if (sec === 'strength' && !strengthLoaded) { loadStrengthCharts(getRmMult()); strengthLoaded = true; }
     if (sec === 'cardio'   && !cardioLoaded)   { loadCardioCharts();              cardioLoaded   = true; }
     if (sec === 'body'     && !bodyLoaded)     { loadBodyCharts();                bodyLoaded     = true; }
+    document.getElementById('progress-section-field').value = sec;
+    const url = new URL(window.location.href); url.searchParams.set('section', sec); window.history.replaceState({}, '', url);
 }
 
 // ── 1RM / 5RM TOGGLE ────────────────────────────────────────────────────────
@@ -853,6 +978,15 @@ const BIG4_COLORS = {
 
 let big4RawData      = null;
 let big4ChartInstance = null;
+let big4TrendMode     = 'session';
+
+function setBig4TrendMode(mode) {
+    big4TrendMode = mode;
+    document.getElementById('big4-session-btn').classList.toggle('active', mode === 'session');
+    document.getElementById('big4-pr-btn').classList.toggle('active', mode === 'pr');
+    if (big4ChartInstance) { big4ChartInstance.destroy(); big4ChartInstance = null; }
+    if (big4RawData) renderBig4Chart(big4RawData, getRmMult());
+}
 
 function renderBig4Chart(byLift, mult) {
     const dateSet = new Set();
@@ -866,7 +1000,11 @@ function renderBig4Chart(byLift, mult) {
     }
 
     const datasets = Object.entries(byLift).map(([name, rows]) => {
-        const map = Object.fromEntries(rows.map(r => [r.date, parseFloat(r.estimated_1rm)]));
+        let best = 0;
+        const displayRows = big4TrendMode === 'pr'
+            ? rows.map(row => ({ ...row, estimated_1rm: best = Math.max(best, parseFloat(row.estimated_1rm)) }))
+            : rows;
+        const map = Object.fromEntries(displayRows.map(r => [r.date, parseFloat(r.estimated_1rm)]));
         return {
             label: name.replace('Barbell ', ''),
             data: allDates.map(d => map[d] != null ? Math.round(map[d] * mult * 10) / 10 : null),
@@ -957,6 +1095,7 @@ async function loadCardioCharts() {
 // ── BODY CHARTS ───────────────────────────────────────────────────────────────
 const BW_TREND  = <?= json_encode(array_map(fn($r) => ['date' => $r['date'], 'bw' => (float)$r['bw']], $bw_trend)) ?>;
 const BF_TREND  = <?= json_encode($bf_trend) ?>;
+const LBM_TREND = <?= json_encode($lbm_trend) ?>;
 
 function loadBodyCharts() {
     // Bodyweight trend
@@ -981,7 +1120,7 @@ function loadBodyCharts() {
                 maintainAspectRatio: false, animation: false,
                 plugins: { legend: { display: false } },
                 scales: {
-                    x: { ticks: { color: '#444', maxTicksLimit: 6, font: { size: 10 } }, grid: { color: '#1a1a1a' } },
+                    x: { ticks: { color: '#888', maxTicksLimit: 6, font: { size: 10 } }, grid: { color: '#1a1a1a' } },
                     y: { ticks: { color: '#888', font: { size: 10 }, callback: v => v + ' kg' }, grid: { color: '#1a1a1a' } },
                 }
             }
@@ -989,6 +1128,39 @@ function loadBodyCharts() {
     } else {
         document.getElementById('bw-empty').classList.remove('d-none');
         document.getElementById('bw-chart').classList.add('d-none');
+    }
+
+    // Estimated lean body mass trend
+    const lbmCanvas = document.getElementById('lbm-chart');
+    if (lbmCanvas && LBM_TREND.length) {
+        new Chart(lbmCanvas, {
+            type: 'line',
+            data: {
+                labels: LBM_TREND.map(r => r.date),
+                datasets: [{
+                    label: 'Lean mass (kg)',
+                    data: LBM_TREND.map(r => r.lbm),
+                    borderColor: '#66bb6a',
+                    backgroundColor: '#66bb6a20',
+                    fill: true,
+                    borderWidth: 2,
+                    pointRadius: 3,
+                    tension: 0.3,
+                    spanGaps: true,
+                }]
+            },
+            options: {
+                maintainAspectRatio: false, animation: false,
+                plugins: {
+                    legend: { display: false },
+                    tooltip: { callbacks: { afterLabel: context => `Estimated BF: ${LBM_TREND[context.dataIndex].bf_pct}%` } },
+                },
+                scales: {
+                    x: { ticks: { color: '#888', maxTicksLimit: 6, font: { size: 10 } }, grid: { color: '#1a1a1a' } },
+                    y: { ticks: { color: '#888', font: { size: 10 }, callback: v => v + ' kg' }, grid: { color: '#1a1a1a' } },
+                }
+            }
+        });
     }
 
     // BF% trend
@@ -1013,9 +1185,9 @@ function loadBodyCharts() {
             data: { labels: dates, datasets },
             options: {
                 maintainAspectRatio: false, animation: false,
-                plugins: { legend: { labels: { color: '#666', font: { size: 10 }, boxWidth: 12 } } },
+                plugins: { legend: { labels: { color: '#888', font: { size: 10 }, boxWidth: 12 } } },
                 scales: {
-                    x: { ticks: { color: '#444', maxTicksLimit: 6, font: { size: 10 } }, grid: { color: '#1a1a1a' } },
+                    x: { ticks: { color: '#888', maxTicksLimit: 6, font: { size: 10 } }, grid: { color: '#1a1a1a' } },
                     y: { ticks: { color: '#888', font: { size: 10 }, callback: v => v + '%' }, grid: { color: '#1a1a1a' } },
                 }
             }
@@ -1023,9 +1195,8 @@ function loadBodyCharts() {
     }
 }
 
-// Load strength charts on page load (default section)
-loadStrengthCharts(getRmMult());
-strengthLoaded = true;
+// Load the section retained in the URL when a period is changed.
+showSection(<?= json_encode($progress_section) ?>);
 </script>
 
 </body>

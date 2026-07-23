@@ -222,11 +222,7 @@ const TEMPLATE_ID = <?= $template_id ?>;
 const UNIT        = <?= json_encode($unit) ?>;
 
 async function api(action, data = {}) {
-    const fd = new FormData();
-    fd.append('action', action);
-    for (const [k, v] of Object.entries(data)) if (v !== null && v !== undefined) fd.append(k, v);
-    const r = await fetch('/forge/core/api.php', { method: 'POST', body: fd });
-    return r.json();
+    return window.forgeApi(action, data);
 }
 
 // Auto-save name/notes on change (silent background save)
@@ -653,11 +649,7 @@ function fmtAgo(string $dt): string {
 
 <script>
 async function api(action, data = {}) {
-    const fd = new FormData();
-    fd.append('action', action);
-    for (const [k, v] of Object.entries(data)) if (v !== null && v !== undefined) fd.append(k, v);
-    const r = await fetch('/forge/core/api.php', { method: 'POST', body: fd });
-    return r.json();
+    return window.forgeApi(action, data);
 }
 
 async function createTemplate() {

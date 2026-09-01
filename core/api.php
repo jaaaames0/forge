@@ -773,8 +773,8 @@ try {
         $caliper   = $_POST['caliper_bf_pct'] ? (float)$_POST['caliper_bf_pct'] : null;
         $measured_at = date('Y-m-d H:i:s');
         if (!$waist && !$neck && !$hip && !$caliper) throw new Exception('At least one measurement required');
-        $db->prepare("INSERT INTO body_measurements (measured_at, waist_cm, neck_cm, hip_cm, caliper_bf_pct) VALUES (?,?,?,?,?)")
-           ->execute([$measured_at, $waist, $neck, $hip, $caliper]);
+        $db->prepare("INSERT INTO body_measurements (measured_at, waist_cm, neck_cm, hip_cm, caliper_bf_pct, era_id) VALUES (?,?,?,?,?,?)")
+           ->execute([$measured_at, $waist, $neck, $hip, $caliper, $active_era_id]);
         echo json_encode(['status' => 'success', 'data' => ['id' => (int)$db->lastInsertId()]]);
 
     } elseif ($action === 'log_hr_sample') {

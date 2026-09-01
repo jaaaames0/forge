@@ -5,7 +5,7 @@
 
 date_default_timezone_set('Australia/Sydney');
 
-const FORGE_SCHEMA_VERSION = 5;
+const FORGE_SCHEMA_VERSION = 6;
 
 function get_db_connection(): PDO {
     $dbPath = getenv('FORGE_DB_PATH') ?: __DIR__ . '/../database/forge.db';
@@ -18,6 +18,27 @@ function get_db_connection(): PDO {
     maybe_seed_exercises($db);
     backfill_current_bodyweight_measurements($db);
     return $db;
+}
+
+/**
+ * Estimate body fat with the circumference (US Navy) method.
+ *
+ * FORGE stores all body measurements in centimetres, while the published
+ * constants expect inches. Convert at the boundary so every caller uses the
+ * same, unit-correct calculation.
+ */
+function forge_navy_bodyfat_pct(string $sex, float $height_cm, ?float $waist_cm, ?float $neck_cm, ?float $hip_cm = null): ?float {
+    if ($height_cm <= 0 || $waist_cm === null || $neck_cm === null || $waist_cm <= $neck_cm) return null;
+    $height_in = $height_cm / 2.54;
+    $waist_in  = $waist_cm / 2.54;
+    $neck_in   = $neck_cm / 2.54;
+    if ($sex === 'F') {
+        if ($hip_cm === null || $hip_cm <= 0) return null;
+        $circumference_in = $waist_in + ($hip_cm / 2.54) - $neck_in;
+        if ($circumference_in <= 0) return null;
+        return round(163.205 * log10($circumference_in) - 97.684 * log10($height_in) - 78.387, 1);
+    }
+    return round(86.01 * log10($waist_in - $neck_in) - 70.041 * log10($height_in) + 36.76, 1);
 }
 
 /** Keep current-era workout weigh-ins available for interpolation. */

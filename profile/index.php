@@ -40,11 +40,7 @@ $latest_m = null;
 foreach ($measurements as $m) {
     if ($m['waist_cm'] && $m['neck_cm'] && $height_m && $profile['sex']) {
         $latest_m = $m;
-        if ($profile['sex'] === 'M') {
-            $navy_bf = round(86.01 * log10($m['waist_cm'] - $m['neck_cm']) - 70.041 * log10($profile['height_cm']) + 36.76, 1);
-        } elseif ($profile['sex'] === 'F' && $m['hip_cm']) {
-            $navy_bf = round(163.205 * log10($m['waist_cm'] + $m['hip_cm'] - $m['neck_cm']) - 97.684 * log10($profile['height_cm']) - 78.387, 1);
-        }
+        $navy_bf = forge_navy_bodyfat_pct($profile['sex'], (float)$profile['height_cm'], (float)$m['waist_cm'], (float)$m['neck_cm'], $m['hip_cm'] !== null ? (float)$m['hip_cm'] : null);
         break;
     }
 }
@@ -431,11 +427,7 @@ window.forgeWarmupPresets = {
             <?php foreach ($measurements as $i => $m):
                 $entry_bf = null;
                 if ($m['waist_cm'] && $m['neck_cm'] && $height_m && $profile['sex']) {
-                    if ($profile['sex'] === 'M') {
-                        $entry_bf = round(86.01 * log10($m['waist_cm'] - $m['neck_cm']) - 70.041 * log10($profile['height_cm']) + 36.76, 1);
-                    } elseif ($profile['sex'] === 'F' && $m['hip_cm']) {
-                        $entry_bf = round(163.205 * log10($m['waist_cm'] + $m['hip_cm'] - $m['neck_cm']) - 97.684 * log10($profile['height_cm']) - 78.387, 1);
-                    }
+                    $entry_bf = forge_navy_bodyfat_pct($profile['sex'], (float)$profile['height_cm'], (float)$m['waist_cm'], (float)$m['neck_cm'], $m['hip_cm'] !== null ? (float)$m['hip_cm'] : null);
                 }
                 $entry_smoothed = null;
                 if ($entry_bf !== null && $m['caliper_bf_pct']) $entry_smoothed = round(($entry_bf + $m['caliper_bf_pct']) / 2, 1);

@@ -112,7 +112,7 @@ foreach ($big4_def as $key => $def) {
     $eid    = $ex_id_map[$def['name']] ?? null;
     $pr     = 0.0;
     if ($eid) {
-        $pr_stmt = $db->prepare("SELECT ws.weight_kg * (1 + ws.reps / 30.0) FROM workout_sets ws JOIN workouts w ON w.id = ws.workout_id WHERE ws.exercise_id = ? AND ws.set_type = 'working' AND ws.reps BETWEEN 1 AND 30 AND ws.weight_kg > 0 AND w.finished_at IS NOT NULL{$scope_clause} ORDER BY w.started_at DESC, ws.id DESC LIMIT 1");
+        $pr_stmt = $db->prepare("SELECT MAX(ws.weight_kg * (1 + ws.reps / 30.0)) FROM workout_sets ws JOIN workouts w ON w.id = ws.workout_id WHERE ws.exercise_id = ? AND ws.set_type = 'working' AND ws.reps BETWEEN 1 AND 30 AND ws.weight_kg > 0 AND w.finished_at IS NOT NULL{$scope_clause}");
         $pr_stmt->execute([$eid, ...$scope_params]); $pr = (float)($pr_stmt->fetchColumn() ?: 0);
     }
     $big4[$key] = ['name' => $def['name'], 'exercise_id' => $eid, 'scaled' => $scaled, 'current_1rm' => round($pr, 1)];
@@ -170,15 +170,14 @@ $ctotals = $ctotals_stmt->fetch(PDO::FETCH_ASSOC) ?: ['total_km' => 0, 'total_se
 $total_hrs = $ctotals['total_sec'] > 0 ? round($ctotals['total_sec'] / 3600, 1) : 0;
 
 // ── BODY DATA ─────────────────────────────────────────────────────────────────
-$body_scope = $selected_cycle ? ' AND measured_at >= ? AND measured_at <= ?' : '';
 $body_scope_params = $selected_cycle ? [$selected_cycle['starts_at'], $as_of_at ?: $selected_cycle['ends_at']] : [];
 $body_era_clause = $cycle_context === 'all' ? '' : ' AND era_id = ?';
 $body_era_params = $cycle_context === 'all' ? [] : [$selected_cycle ? (int)$selected_cycle['era_id'] : $active_era_id];
 $body_stmt = $db->prepare("
     SELECT id, measured_at, waist_cm, neck_cm, hip_cm, caliper_bf_pct
-    FROM body_measurements WHERE 1 = 1{$body_era_clause}{$body_scope} ORDER BY measured_at DESC LIMIT 10
+    FROM body_measurements WHERE 1 = 1{$body_era_clause} ORDER BY measured_at DESC LIMIT 10
 ");
-$body_stmt->execute([...$body_era_params, ...$body_scope_params]);
+$body_stmt->execute($body_era_params);
 $body_measurements = $body_stmt->fetchAll(PDO::FETCH_ASSOC);
 
 $latest_meas = $body_measurements[0] ?? null;
@@ -189,11 +188,7 @@ $caliper_bf = $selected_cycle
     ? forge_cycle_bodyfat($db, (int)$selected_cycle['era_id'], $as_of_at ?: $selected_cycle['ends_at'])
     : ($latest_meas ? (float)($latest_meas['caliper_bf_pct'] ?: 0) ?: null : null);
 if ($latest_meas && $height_cm > 0 && $latest_meas['waist_cm'] && $latest_meas['neck_cm']) {
-    if ($is_female && $latest_meas['hip_cm']) {
-        $navy_bf = round(163.205 * log10((float)$latest_meas['waist_cm'] + (float)$latest_meas['hip_cm'] - (float)$latest_meas['neck_cm']) - 97.684 * log10($height_cm) - 78.387, 1);
-    } else {
-        $navy_bf = round(86.01 * log10((float)$latest_meas['waist_cm'] - (float)$latest_meas['neck_cm']) - 70.041 * log10($height_cm) + 36.76, 1);
-    }
+    $navy_bf = forge_navy_bodyfat_pct($profile_sex, $height_cm, (float)$latest_meas['waist_cm'], (float)$latest_meas['neck_cm'], $latest_meas['hip_cm'] !== null ? (float)$latest_meas['hip_cm'] : null);
 }
 $bf_vals     = array_filter([$navy_bf, $caliper_bf], fn($v) => $v !== null);
 $smoothed_bf = count($bf_vals) ? round(array_sum($bf_vals) / count($bf_vals), 1) : null;
@@ -215,25 +210,40 @@ $bw_stmt = $db->prepare("
 $bw_stmt->execute([...$body_era_params, ...$body_scope_params]);
 $bw_trend = $bw_stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// BF% trend (chronological for chart)
+// BF% trend (chronological for chart). A cycle is a reporting window, not a
+// physiological hard stop: retain the nearest measurement on either side so
+// the line and lean-mass calculation have meaningful continuity.
 $bf_stmt = $db->prepare("
-    SELECT DATE(measured_at) as date, waist_cm, neck_cm, hip_cm, caliper_bf_pct
-    FROM body_measurements WHERE 1 = 1{$body_era_clause}{$body_scope} ORDER BY measured_at ASC
+    SELECT measured_at, DATE(measured_at) as date, waist_cm, neck_cm, hip_cm, caliper_bf_pct
+    FROM body_measurements WHERE 1 = 1{$body_era_clause} ORDER BY measured_at ASC
 ");
-$bf_stmt->execute([...$body_era_params, ...$body_scope_params]);
+$bf_stmt->execute($body_era_params);
 $bf_trend_raw = $bf_stmt->fetchAll(PDO::FETCH_ASSOC);
+if ($selected_cycle) {
+    $cycle_start = strtotime($selected_cycle['starts_at']);
+    $cycle_end = strtotime($as_of_at ?: $selected_cycle['ends_at']);
+    $before = null;
+    $inside = [];
+    $after = null;
+    foreach ($bf_trend_raw as $row) {
+        $measured_at = strtotime($row['measured_at']);
+        if ($measured_at < $cycle_start) {
+            $before = $row;
+        } elseif ($measured_at > $cycle_end) {
+            if ($after === null) $after = $row;
+        } else {
+            $inside[] = $row;
+        }
+    }
+    $bf_trend_raw = array_values(array_filter([$before, ...$inside, $after]));
+}
 
 // Pre-compute BF% for each measurement for chart
 $bf_trend = [];
 foreach ($bf_trend_raw as $row) {
-    $n = null;
-    if ($height_cm > 0 && $row['waist_cm'] && $row['neck_cm']) {
-        if ($is_female && $row['hip_cm']) {
-            $n = round(163.205 * log10((float)$row['waist_cm'] + (float)$row['hip_cm'] - (float)$row['neck_cm']) - 97.684 * log10($height_cm) - 78.387, 1);
-        } else {
-            $n = round(86.01 * log10((float)$row['waist_cm'] - (float)$row['neck_cm']) - 70.041 * log10($height_cm) + 36.76, 1);
-        }
-    }
+    $n = $height_cm > 0 && $row['waist_cm'] && $row['neck_cm']
+        ? forge_navy_bodyfat_pct($profile_sex, $height_cm, (float)$row['waist_cm'], (float)$row['neck_cm'], $row['hip_cm'] !== null ? (float)$row['hip_cm'] : null)
+        : null;
     $c = $row['caliper_bf_pct'] ? (float)$row['caliper_bf_pct'] : null;
     $vs = array_filter([$n, $c], fn($v) => $v !== null);
     $bf_trend[] = ['date' => $row['date'], 'navy' => $n, 'caliper' => $c, 'smoothed' => count($vs) ? round(array_sum($vs)/count($vs),1) : null];
@@ -254,8 +264,8 @@ if ($selected_cycle) {
 $bf_anchors = array_values(array_filter($bf_trend, fn($row) => $row['smoothed'] !== null));
 $lbm_trend = [];
 if ($bf_anchors) {
-    foreach ($bw_trend as $weight_row) {
-        $date_ts = strtotime($weight_row['date']);
+    $estimate_bf_at = function (string $date) use ($bf_anchors): ?float {
+        $date_ts = strtotime($date);
         $before = null;
         $after = null;
         foreach ($bf_anchors as $anchor) {
@@ -266,24 +276,59 @@ if ($bf_anchors) {
                 break;
             }
         }
-
-        if ($before === null) {
-            $estimated_bf = (float)$bf_anchors[0]['smoothed'];
-        } elseif ($after === null) {
-            $estimated_bf = (float)$bf_anchors[count($bf_anchors) - 1]['smoothed'];
-        } else {
-            $before_ts = strtotime($before['date']);
-            $after_ts = strtotime($after['date']);
-            $fraction = $after_ts === $before_ts ? 0 : ($date_ts - $before_ts) / ($after_ts - $before_ts);
-            $estimated_bf = (float)$before['smoothed'] + $fraction * ((float)$after['smoothed'] - (float)$before['smoothed']);
+        if ($before === null) return (float)$bf_anchors[0]['smoothed'];
+        if ($after === null) return (float)$bf_anchors[count($bf_anchors) - 1]['smoothed'];
+        $before_ts = strtotime($before['date']);
+        $after_ts = strtotime($after['date']);
+        $fraction = $after_ts === $before_ts ? 0 : ($date_ts - $before_ts) / ($after_ts - $before_ts);
+        return (float)$before['smoothed'] + $fraction * ((float)$after['smoothed'] - (float)$before['smoothed']);
+    };
+    $estimate_bw_at = function (string $date) use ($bw_trend): ?float {
+        if (!$bw_trend) return null;
+        $date_ts = strtotime($date);
+        $before = null;
+        $after = null;
+        foreach ($bw_trend as $weight) {
+            $weight_ts = strtotime($weight['date']);
+            if ($weight_ts <= $date_ts) $before = $weight;
+            if ($weight_ts >= $date_ts) {
+                $after = $weight;
+                break;
+            }
         }
+        if ($before === null) return (float)$bw_trend[0]['bw'];
+        if ($after === null) return (float)$bw_trend[count($bw_trend) - 1]['bw'];
+        $before_ts = strtotime($before['date']);
+        $after_ts = strtotime($after['date']);
+        $fraction = $after_ts === $before_ts ? 0 : ($date_ts - $before_ts) / ($after_ts - $before_ts);
+        return (float)$before['bw'] + $fraction * ((float)$after['bw'] - (float)$before['bw']);
+    };
 
-        $lbm_trend[] = [
+    // Keep the usual workout-based points, then add direct BF% measurement
+    // dates. A new BF%-only entry therefore produces a lean-mass point using
+    // the interpolated (or nearest) recorded bodyweight for that day.
+    $lbm_points = [];
+    foreach ($bw_trend as $weight_row) {
+        $estimated_bf = $estimate_bf_at($weight_row['date']);
+        $lbm_points[$weight_row['date']] = [
             'date' => $weight_row['date'],
             'lbm' => round((float)$weight_row['bw'] * (1 - $estimated_bf / 100), 1),
             'bf_pct' => round($estimated_bf, 1),
         ];
     }
+    foreach ($bf_trend_raw as $measurement) {
+        $date = date('Y-m-d', strtotime($measurement['date']));
+        $estimated_bw = $estimate_bw_at($date);
+        $estimated_bf = $estimate_bf_at($date);
+        if ($estimated_bw === null || $estimated_bf === null) continue;
+        $lbm_points[$date] = [
+            'date' => $date,
+            'lbm' => round($estimated_bw * (1 - $estimated_bf / 100), 1),
+            'bf_pct' => round($estimated_bf, 1),
+        ];
+    }
+    ksort($lbm_points);
+    $lbm_trend = array_values($lbm_points);
 }
 
 // ── STRENGTH RATIOS ────────────────────────────────────────────────────────
@@ -816,14 +861,9 @@ function standards_card(array $lift, array $level_names, string $unit): string {
                 $last = count($body_measurements) - 1;
                 foreach ($body_measurements as $mi => $m):
                     // Compute BF% for this row
-                    $mn = null;
-                    if ($height_cm > 0 && $m['waist_cm'] && $m['neck_cm']) {
-                        if ($is_female && $m['hip_cm']) {
-                            $mn = round(163.205 * log10((float)$m['waist_cm'] + (float)$m['hip_cm'] - (float)$m['neck_cm']) - 97.684 * log10($height_cm) - 78.387, 1);
-                        } else {
-                            $mn = round(86.01 * log10((float)$m['waist_cm'] - (float)$m['neck_cm']) - 70.041 * log10($height_cm) + 36.76, 1);
-                        }
-                    }
+                    $mn = $height_cm > 0 && $m['waist_cm'] && $m['neck_cm']
+                        ? forge_navy_bodyfat_pct($profile_sex, $height_cm, (float)$m['waist_cm'], (float)$m['neck_cm'], $m['hip_cm'] !== null ? (float)$m['hip_cm'] : null)
+                        : null;
                     $mc = $m['caliper_bf_pct'] ? (float)$m['caliper_bf_pct'] : null;
                     $mv = array_filter([$mn, $mc], fn($v) => $v !== null);
                     $ms = count($mv) ? round(array_sum($mv)/count($mv),1) : null;

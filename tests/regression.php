@@ -47,6 +47,10 @@ try {
     if ($schema === false) throw new RuntimeException('Could not read schema');
     $bootstrap = new PDO('sqlite:' . $db_path);
     $bootstrap->exec($schema);
+    // Simulate the pre-v6 save path, which could leave manual measurements
+    // without an era. The migration must repair those existing readings.
+    $bootstrap->exec("INSERT INTO schema_migrations (version) VALUES (5)");
+    $bootstrap->exec("INSERT INTO body_measurements (measured_at, caliper_bf_pct, era_id) VALUES ('2026-01-01 08:00:00', 20.0, NULL)");
     putenv("FORGE_DB_PATH={$db_path}");
     require_once __DIR__ . '/../core/db_helper.php';
     require_once __DIR__ . '/../core/cycle_analysis.php';
@@ -57,8 +61,10 @@ try {
     foreach (['idx_workout_sets_workout', 'idx_workout_sets_exercise_workout', 'idx_workouts_finished_started'] as $index) {
         check(in_array($index, $indexes, true), "{$index} exists");
     }
-    check((int)$db->query('SELECT MAX(version) FROM schema_migrations')->fetchColumn() === 5, 'schema migration version is recorded');
+    check((int)$db->query('SELECT MAX(version) FROM schema_migrations')->fetchColumn() === 6, 'schema migration version is recorded');
     check((bool)$db->query('SELECT id FROM training_eras WHERE is_active = 1')->fetchColumn(), 'active training era is created');
+    check((int)$db->query('SELECT COUNT(*) FROM body_measurements WHERE era_id IS NULL')->fetchColumn() === 0, 'legacy body measurements are assigned to the active era');
+    check(forge_navy_bodyfat_pct('M', 176.0, 100.0, 42.0) === 24.7, 'Navy body-fat calculation converts centimetres to inches');
 
     $db->exec("INSERT INTO exercises (name, category) VALUES ('Test Press', 'Barbell')");
     $exercise_id = (int)$db->lastInsertId();

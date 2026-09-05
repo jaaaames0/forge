@@ -9,7 +9,8 @@ header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
 
 // Load key from gitignored credentials file, fallback to env var
-$_creds_file = '/srv/secrets/forge_credentials.env';
+$_creds_file = getenv('FORGE_CREDENTIAL_FILE')
+    ?: '/srv/secrets/forge_credentials.env';
 $ACCESS_KEY  = file_exists($_creds_file)
     ? trim(file_get_contents($_creds_file))
     : (getenv('FORGE_ACCESS_KEY') ?: '');

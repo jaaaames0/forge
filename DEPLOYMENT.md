@@ -7,7 +7,8 @@ from this working tree.
 - Versioned runtime: `/usr/local/lib/forge/RELEASE`
 - Public compatibility path: `/srv/jaaaames.com/forge`
 - Mutable database: `/var/lib/forge/forge.db`
-- Credentials: `/srv/secrets/forge_credentials.env`
+- Credential: `/etc/forge/access-key` (`0640 root:forge-web`; the dedicated pool
+  supplies the path through `FORGE_CREDENTIAL_FILE`)
 
 The runtime is created from a clean Git archive and is owned by root. Its
 `database/forge.db` entry is a symlink to the mutable database. Never copy the
@@ -25,6 +26,25 @@ run the regression suite with the system library selected explicitly:
 LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu php tests/regression.php
 ```
 
-Deployments must use a checkpoint, a timed rollback, SQLite integrity checks,
-PHP lint, nginx validation, HTTP/authentication tests, and a real application
-write before the old runtime is retired.
+## Deploying
+
+Code-only changes are fast-lane deploys (`/home/james/AGENTS.md`, host handbook
+§9.1). Commit, then:
+
+```bash
+fastdeploy forge             # tests, build, PHP lint, SQLite snapshot, switch, reload
+fastdeploy forge --status
+fastdeploy forge --rollback  # back to the previous release
+```
+
+`/srv/jaaaames.com/forge` links to `/usr/local/lib/forge/current`, which links to
+the release. `fastdeploy` exports an allowlist of tracked runtime paths (see
+`/home/james/src/fastdeploy/projects/forge.conf`) into a new root-owned release,
+recreates the state symlinks, takes a consistent SQLite snapshot under
+`/data/security-backups/fastdeploy/forge`, switches `current`, reloads
+`php8.3-fpm`, and switches back if `https://jaaaames.com/forge/` stops
+answering. A new top-level runtime directory must be added to that allowlist.
+
+Use the full procedure (checkpoint, timed rollback, operator acceptance) for
+changes to the PHP-FPM pool, AppArmor hat, credentials, nginx, or a schema
+change the previous release cannot read.

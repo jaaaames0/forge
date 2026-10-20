@@ -106,16 +106,32 @@ $id_stmt->execute($all_names);
 $ex_id_map = [];
 foreach ($id_stmt->fetchAll(PDO::FETCH_ASSOC) as $row) $ex_id_map[$row['name']] = (int)$row['id'];
 
+// Current e1RM = best of the last N sessions that included the lift (as of the
+// scrubber date). Counting sessions rather than days means rest days between
+// sessions never drag it down. N depends on the cycle: on a cut (or detraining)
+// strength genuinely falls, so the latest session is taken as truth; on a bulk
+// a dip is assumed to be an off day or deload until it persists.
+$standards_cycle_type = ($selected_cycle ?: $active_cycle)['cycle_type'] ?? 'unknown';
+$standards_lookback   = match ($standards_cycle_type) {
+    'cut', 'detraining' => 1,
+    'bulk'              => 3,
+    default             => 2,
+};
 $big4 = [];
 foreach ($big4_def as $key => $def) {
     $scaled = array_map(fn($v) => (int)round($v * $bw_scale), $def['ref']);
     $eid    = $ex_id_map[$def['name']] ?? null;
-    $pr     = 0.0;
+    $current = $peak = 0.0;
     if ($eid) {
-        $pr_stmt = $db->prepare("SELECT MAX(ws.weight_kg * (1 + ws.reps / 30.0)) FROM workout_sets ws JOIN workouts w ON w.id = ws.workout_id WHERE ws.exercise_id = ? AND ws.set_type = 'working' AND ws.reps BETWEEN 1 AND 30 AND ws.weight_kg > 0 AND w.finished_at IS NOT NULL{$scope_clause}");
-        $pr_stmt->execute([$eid, ...$scope_params]); $pr = (float)($pr_stmt->fetchColumn() ?: 0);
+        $sess_stmt = $db->prepare("SELECT MAX(ws.weight_kg * (1 + ws.reps / 30.0)) AS e1rm FROM workout_sets ws JOIN workouts w ON w.id = ws.workout_id WHERE ws.exercise_id = ? AND ws.set_type = 'working' AND ws.reps BETWEEN 1 AND 30 AND ws.weight_kg > 0 AND w.finished_at IS NOT NULL{$scope_clause} GROUP BY w.id ORDER BY w.started_at DESC");
+        $sess_stmt->execute([$eid, ...$scope_params]);
+        $session_bests = array_map('floatval', $sess_stmt->fetchAll(PDO::FETCH_COLUMN));
+        if ($session_bests) {
+            $current = max(array_slice($session_bests, 0, $standards_lookback));
+            $peak    = max($session_bests);
+        }
     }
-    $big4[$key] = ['name' => $def['name'], 'exercise_id' => $eid, 'scaled' => $scaled, 'current_1rm' => round($pr, 1)];
+    $big4[$key] = ['name' => $def['name'], 'exercise_id' => $eid, 'scaled' => $scaled, 'current_1rm' => round($current, 1), 'peak_1rm' => round($peak, 1)];
 }
 
 // 5RM variants (Epley: 5RM = 1RM × 6/7 ≈ 0.857)
@@ -125,6 +141,7 @@ foreach ($big4 as $key => $lift) {
     $big4_5rm[$key] = $lift;
     $big4_5rm[$key]['scaled']      = array_map(fn($v) => (int)round($v * $rm5_mult), $lift['scaled']);
     $big4_5rm[$key]['current_1rm'] = round($lift['current_1rm'] * $rm5_mult, 1);
+    $big4_5rm[$key]['peak_1rm']    = round($lift['peak_1rm'] * $rm5_mult, 1);
 }
 
 // ── PR BOARD ───────────────────────────────────────────────────────────────
@@ -384,6 +401,8 @@ function standards_card(array $lift, array $level_names, string $unit): string {
     } else {
         $sub = "Log a working set to see your level";
     }
+    $peak = (float)($lift['peak_1rm'] ?? 0);
+    if ($current > 0 && round($peak) > round($current)) $sub .= " &nbsp;<span style='color:#666;'>· Peak " . round($peak) . " {$unit}</span>";
 
     // Tick marks and labels
     $ticks = '';
@@ -469,7 +488,7 @@ function standards_card(array $lift, array $level_names, string $unit): string {
     <div id="sec-strength">
 
         <div class="d-flex align-items-center justify-content-between mb-3">
-            <div class="stat-label">STRENGTH STANDARDS <span class="text-muted" style="font-weight:400;font-size:0.65rem;">· Symmetric Strength · scaled to <?= round($bw,1) ?> kg BW</span></div>
+            <div class="stat-label">STRENGTH STANDARDS <span class="text-muted" style="font-weight:400;font-size:0.65rem;">· Symmetric Strength · scaled to <?= round($bw,1) ?> kg BW · <?= $standards_lookback === 1 ? 'latest session' : "best of last {$standards_lookback} sessions" ?> (<?= htmlspecialchars(forge_cycle_label($standards_cycle_type)) ?>)</span></div>
             <div style="background:#111;border-radius:6px;padding:2px;display:flex;gap:2px;flex-shrink:0;">
                 <button id="btn-1rm" class="seg-btn active" onclick="setRmMode('1rm')" style="padding:4px 10px;font-size:0.65rem;min-height:30px;border-radius:4px;">e1RM</button>
                 <button id="btn-5rm" class="seg-btn" onclick="setRmMode('5rm')" style="padding:4px 10px;font-size:0.65rem;min-height:30px;border-radius:4px;">5RM</button>

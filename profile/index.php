@@ -1,6 +1,7 @@
 <?php
 require_once __DIR__ . '/../core/auth.php';
 require_once __DIR__ . '/../core/db_helper.php';
+require_once __DIR__ . '/../core/cycle_analysis.php';
 
 $db = get_db_connection();
 
@@ -34,26 +35,15 @@ $measurements = $db->query("
     SELECT * FROM body_measurements ORDER BY measured_at DESC LIMIT 10
 ")->fetchAll(PDO::FETCH_ASSOC);
 
-// Most recent valid measurement for Navy BF% calculation
-$navy_bf = null;
-$latest_m = null;
-foreach ($measurements as $m) {
-    if ($m['waist_cm'] && $m['neck_cm'] && $height_m && $profile['sex']) {
-        $latest_m = $m;
-        $navy_bf = forge_navy_bodyfat_pct($profile['sex'], (float)$profile['height_cm'], (float)$m['waist_cm'], (float)$m['neck_cm'], $m['hip_cm'] !== null ? (float)$m['hip_cm'] : null);
-        break;
-    }
-}
-
-$caliper_bf  = $latest_m ? $latest_m['caliper_bf_pct'] : null;
-$smoothed_bf = null;
-if ($navy_bf !== null && $caliper_bf !== null) {
-    $smoothed_bf = round(($navy_bf + $caliper_bf) / 2, 1);
-} elseif ($navy_bf !== null) {
-    $smoothed_bf = $navy_bf;
-} elseif ($caliper_bf !== null) {
-    $smoothed_bf = round($caliper_bf, 1);
-}
+// Current body fat: each method carried forward from its latest reading this era
+$bf_readings_by_era = [];
+$bf_readings_for = function (int $era_id) use ($db, &$bf_readings_by_era): array {
+    return $bf_readings_by_era[$era_id] ??= forge_bodyfat_readings($db, $era_id);
+};
+$bf_now      = forge_bodyfat_at($bf_readings_for(active_training_era_id($db)), date('Y-m-d H:i:s'));
+$navy_bf     = $bf_now['navy'];
+$caliper_bf  = $bf_now['caliper'];
+$smoothed_bf = $bf_now['smoothed'];
 
 $lean_kg = ($smoothed_bf !== null && $bw) ? round($bw * (1 - $smoothed_bf / 100), 1) : null;
 $fat_kg  = ($smoothed_bf !== null && $bw) ? round($bw * ($smoothed_bf / 100), 1)       : null;
@@ -425,14 +415,9 @@ window.forgeWarmupPresets = {
         <div class="card mb-3">
             <div class="card-body p-0">
             <?php foreach ($measurements as $i => $m):
-                $entry_bf = null;
-                if ($m['waist_cm'] && $m['neck_cm'] && $height_m && $profile['sex']) {
-                    $entry_bf = forge_navy_bodyfat_pct($profile['sex'], (float)$profile['height_cm'], (float)$m['waist_cm'], (float)$m['neck_cm'], $m['hip_cm'] !== null ? (float)$m['hip_cm'] : null);
-                }
-                $entry_smoothed = null;
-                if ($entry_bf !== null && $m['caliper_bf_pct']) $entry_smoothed = round(($entry_bf + $m['caliper_bf_pct']) / 2, 1);
-                elseif ($entry_bf !== null) $entry_smoothed = $entry_bf;
-                elseif ($m['caliper_bf_pct']) $entry_smoothed = round($m['caliper_bf_pct'], 1);
+                $entry_smoothed = $m['era_id'] !== null
+                    ? forge_bodyfat_at($bf_readings_for((int)$m['era_id']), $m['measured_at'])['smoothed']
+                    : null;
             ?>
             <div class="d-flex align-items-center px-3 py-2 gap-3"
                  style="border-bottom:1px solid #1a1a1a;<?= $i === count($measurements)-1 ? 'border-bottom:none;' : '' ?>">

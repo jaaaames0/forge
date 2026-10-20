@@ -2,6 +2,9 @@
 /** Shared, reproducible metrics for automatically detected training cycles. */
 declare(strict_types=1);
 
+/** Bump when forge_analyse_cycle() changes so stored cycle metrics are recomputed. */
+const FORGE_CYCLE_METRICS_VERSION = 2;
+
 const FORGE_CYCLE_BIG_FOUR = [
     'Barbell Back Squat', 'Barbell Bench Press', 'Deadlift', 'Overhead Press',
 ];
@@ -19,16 +22,66 @@ function forge_cycle_bodyweight(PDO $db, int $era_id, string $at): ?float {
 }
 
 /** Interpolate recorded caliper body-fat percentage at a point in time. */
-function forge_cycle_bodyfat(PDO $db, int $era_id, string $at): ?float {
-    $before = $db->prepare('SELECT measured_at, caliper_bf_pct FROM body_measurements WHERE era_id = ? AND caliper_bf_pct IS NOT NULL AND measured_at <= ? ORDER BY measured_at DESC LIMIT 1');
-    $after = $db->prepare('SELECT measured_at, caliper_bf_pct FROM body_measurements WHERE era_id = ? AND caliper_bf_pct IS NOT NULL AND measured_at >= ? ORDER BY measured_at ASC LIMIT 1');
-    $before->execute([$era_id, $at]); $after->execute([$era_id, $at]);
-    $a = $before->fetch(PDO::FETCH_ASSOC); $b = $after->fetch(PDO::FETCH_ASSOC);
-    if (!$a && !$b) return null;
-    if (!$a || !$b) return round((float)($a ?: $b)['caliper_bf_pct'], 1);
-    $ta = strtotime($a['measured_at']); $tb = strtotime($b['measured_at']); $t = strtotime($at);
-    if ($ta === $tb) return round((float)$a['caliper_bf_pct'], 1);
-    return round((float)$a['caliper_bf_pct'] + (($t - $ta) / ($tb - $ta)) * ((float)$b['caliper_bf_pct'] - (float)$a['caliper_bf_pct']), 1);
+/**
+ * Value of $value_key at $at across chronological $points, linearly
+ * interpolated between the nearest non-null readings and held flat beyond the
+ * first or last one. Null when no point has a value.
+ */
+function forge_series_at(array $points, string $date_key, string $value_key, string $at): ?float {
+    $t = strtotime($at); $before = null; $after = null;
+    foreach ($points as $p) {
+        if ($p[$value_key] === null) continue;
+        $pt = strtotime($p[$date_key]);
+        if ($pt <= $t) $before = $p;
+        if ($pt >= $t) { $after = $p; break; }
+    }
+    if (!$before && !$after) return null;
+    if (!$before || !$after) return (float)($before ?? $after)[$value_key];
+    $tb = strtotime($before[$date_key]); $ta = strtotime($after[$date_key]);
+    if ($ta === $tb) return (float)$before[$value_key];
+    return (float)$before[$value_key] + (($t - $tb) / ($ta - $tb)) * ((float)$after[$value_key] - (float)$before[$value_key]);
+}
+
+/**
+ * Body-fat readings in chronological order, each with its Navy and caliper
+ * estimate (either may be null). Limited to one era unless $era_id is null.
+ */
+function forge_bodyfat_readings(PDO $db, ?int $era_id = null): array {
+    $sex = get_user_setting($db, 'profile_sex', 'M');
+    $height_cm = (float)(get_user_setting($db, 'profile_height_cm', '0') ?: 0);
+    $stmt = $db->prepare('SELECT id, era_id, measured_at, DATE(measured_at) AS date, waist_cm, neck_cm, hip_cm, caliper_bf_pct
+        FROM body_measurements' . ($era_id !== null ? ' WHERE era_id = ?' : '') . ' ORDER BY measured_at ASC');
+    $stmt->execute($era_id !== null ? [$era_id] : []);
+    $readings = [];
+    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $row['navy'] = $height_cm > 0 && $row['waist_cm'] && $row['neck_cm']
+            ? forge_navy_bodyfat_pct($sex, $height_cm, (float)$row['waist_cm'], (float)$row['neck_cm'], $row['hip_cm'] !== null ? (float)$row['hip_cm'] : null)
+            : null;
+        $row['caliper'] = $row['caliper_bf_pct'] ? (float)$row['caliper_bf_pct'] : null;
+        $readings[] = $row;
+    }
+    return $readings;
+}
+
+/**
+ * Navy, caliper and smoothed body fat at $at. Each method is a separate series,
+ * interpolated between its own readings and held at its latest value, so an
+ * entry (or a day) without one method does not drop it from the average.
+ */
+function forge_bodyfat_at(array $readings, string $at): array {
+    $n = forge_series_at($readings, 'measured_at', 'navy', $at);
+    $c = forge_series_at($readings, 'measured_at', 'caliper', $at);
+    $vs = array_filter([$n, $c], fn($v) => $v !== null);
+    return [
+        'navy' => $n !== null ? round($n, 1) : null,
+        'caliper' => $c !== null ? round($c, 1) : null,
+        'smoothed' => count($vs) ? round(array_sum($vs) / count($vs), 1) : null,
+    ];
+}
+
+/** Smoothed body fat within an era at $at; pass $readings when calling in a loop. */
+function forge_cycle_bodyfat(PDO $db, int $era_id, string $at, ?array $readings = null): ?float {
+    return forge_bodyfat_at($readings ?? forge_bodyfat_readings($db, $era_id), $at)['smoothed'];
 }
 
 /**
@@ -49,8 +102,9 @@ function forge_analyse_cycle(PDO $db, array $cycle): array {
         $days = max(1, (strtotime($end) - strtotime($start)) / 86400);
         $metrics['weekly_rate_kg'] = round($metrics['change_kg'] / $days * 7, 2);
     }
-    $metrics['body_fat_start_pct'] = forge_cycle_bodyfat($db, $era_id, $start);
-    $metrics['body_fat_end_pct'] = forge_cycle_bodyfat($db, $era_id, $end);
+    $bf_readings = forge_bodyfat_readings($db, $era_id);
+    $metrics['body_fat_start_pct'] = forge_cycle_bodyfat($db, $era_id, $start, $bf_readings);
+    $metrics['body_fat_end_pct'] = forge_cycle_bodyfat($db, $era_id, $end, $bf_readings);
     if ($metrics['body_fat_start_pct'] !== null && $metrics['body_fat_end_pct'] !== null) {
         $metrics['body_fat_change_pct'] = round($metrics['body_fat_end_pct'] - $metrics['body_fat_start_pct'], 1);
     }
@@ -114,8 +168,8 @@ function forge_analyse_cycle(PDO $db, array $cycle): array {
         $pct = round(($to / $from - 1) * 100, 1);
         $from_bw = forge_cycle_bodyweight($db, $era_id, $first['started_at']);
         $to_bw = forge_cycle_bodyweight($db, $era_id, $last['started_at']);
-        $from_bf = forge_cycle_bodyfat($db, $era_id, $first['started_at']);
-        $to_bf = forge_cycle_bodyfat($db, $era_id, $last['started_at']);
+        $from_bf = forge_cycle_bodyfat($db, $era_id, $first['started_at'], $bf_readings);
+        $to_bf = forge_cycle_bodyfat($db, $era_id, $last['started_at'], $bf_readings);
         $from_lbm = $from_bw !== null && $from_bf !== null ? $from_bw * (1 - $from_bf / 100) : null;
         $to_lbm = $to_bw !== null && $to_bf !== null ? $to_bw * (1 - $to_bf / 100) : null;
         $lift_metrics[$name] = [
@@ -135,7 +189,24 @@ function forge_analyse_cycle(PDO $db, array $cycle): array {
     if (!empty($metrics['change_kg']) && isset($metrics['strength_change_pct']) && (float)$metrics['change_kg'] !== 0.0) {
         $metrics['strength_pct_per_kg'] = round($metrics['strength_change_pct'] / $metrics['change_kg'], 2);
     }
+    $metrics['metrics_version'] = FORGE_CYCLE_METRICS_VERSION;
     return $metrics;
+}
+
+/**
+ * Recompute stored metrics written by an older forge_analyse_cycle(), keeping
+ * each cycle's boundaries and any detector-only keys. Returns cycles updated.
+ */
+function forge_refresh_stale_cycle_metrics(PDO $db): int {
+    $stale = $db->query("SELECT * FROM training_cycles WHERE COALESCE(json_extract(metrics_json, '$.metrics_version'), 0) < " . FORGE_CYCLE_METRICS_VERSION);
+    $update = $db->prepare('UPDATE training_cycles SET metrics_json = ? WHERE id = ?');
+    $n = 0;
+    foreach ($stale->fetchAll(PDO::FETCH_ASSOC) as $cycle) {
+        $old = json_decode($cycle['metrics_json'] ?? '{}', true) ?: [];
+        $update->execute([json_encode(array_merge($old, forge_analyse_cycle($db, $cycle))), (int)$cycle['id']]);
+        $n++;
+    }
+    return $n;
 }
 
 /**

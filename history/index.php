@@ -51,6 +51,7 @@ if ($exercise_id) {
         WHERE workout_id = ? AND exercise_id = ?
         ORDER BY set_number ASC
     ");
+    $bf_by_era = [];
     foreach ($sessions as &$s) {
         $set_stmt->execute([$s['id'], $exercise_id]);
         $s['sets'] = $set_stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -59,7 +60,8 @@ if ($exercise_id) {
             $best_1rm = (float)$set['estimated_1rm']; $best_set = $set;
         }
         $bodyweight = $s['bodyweight_kg'] !== null ? (float)$s['bodyweight_kg'] : forge_cycle_bodyweight($db, (int)$s['era_id'], $s['started_at']);
-        $bf = forge_cycle_bodyfat($db, (int)$s['era_id'], $s['started_at']);
+        $bf_by_era[(int)$s['era_id']] ??= forge_bodyfat_readings($db, (int)$s['era_id']);
+        $bf = forge_cycle_bodyfat($db, (int)$s['era_id'], $s['started_at'], $bf_by_era[(int)$s['era_id']]);
         $lean_mass = ($bodyweight !== null && $bf !== null) ? round($bodyweight * (1 - $bf / 100), 1) : null;
         $s['best_1rm'] = round($best_1rm, 1); $s['best_set'] = $best_set;
         $s['bodyweight'] = $bodyweight; $s['bodyfat'] = $bf; $s['lean_mass'] = $lean_mass;
@@ -631,6 +633,7 @@ async function deleteWorkout(id) {
 // LIST VIEW
 // ============================================================
 } elseif ($tab === 'cycles') {
+    forge_refresh_stale_cycle_metrics($db);
     $cycles = $db->query("SELECT c.*, e.name AS era_name FROM training_cycles c JOIN training_eras e ON e.id = c.era_id ORDER BY c.starts_at DESC")->fetchAll(PDO::FETCH_ASSOC);
     $compare_raw = $_GET['compare'] ?? [];
     if (!is_array($compare_raw)) $compare_raw = explode(',', (string)$compare_raw);

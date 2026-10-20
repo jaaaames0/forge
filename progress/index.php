@@ -199,19 +199,7 @@ $body_measurements = $body_stmt->fetchAll(PDO::FETCH_ASSOC);
 
 $latest_meas = $body_measurements[0] ?? null;
 
-// Navy BF% from latest measurement
-$navy_bf    = null;
-$caliper_bf = $selected_cycle
-    ? forge_cycle_bodyfat($db, (int)$selected_cycle['era_id'], $as_of_at ?: $selected_cycle['ends_at'])
-    : ($latest_meas ? (float)($latest_meas['caliper_bf_pct'] ?: 0) ?: null : null);
-if ($latest_meas && $height_cm > 0 && $latest_meas['waist_cm'] && $latest_meas['neck_cm']) {
-    $navy_bf = forge_navy_bodyfat_pct($profile_sex, $height_cm, (float)$latest_meas['waist_cm'], (float)$latest_meas['neck_cm'], $latest_meas['hip_cm'] !== null ? (float)$latest_meas['hip_cm'] : null);
-}
-$bf_vals     = array_filter([$navy_bf, $caliper_bf], fn($v) => $v !== null);
-$smoothed_bf = count($bf_vals) ? round(array_sum($bf_vals) / count($bf_vals), 1) : null;
-$lean_mass   = ($smoothed_bf !== null && $bw > 0) ? round($bw * (1 - $smoothed_bf / 100), 1) : null;
-$fat_mass    = ($smoothed_bf !== null && $bw > 0) ? round($bw * ($smoothed_bf / 100), 1) : null;
-$bmi         = ($height_cm > 0 && $bw > 0) ? round($bw / pow($height_cm / 100, 2), 1) : null;
+$bmi        = ($height_cm > 0 && $bw > 0) ? round($bw / pow($height_cm / 100, 2), 1) : null;
 $whr         = ($height_cm > 0 && $latest_meas && $latest_meas['waist_cm']) ? round((float)$latest_meas['waist_cm'] / $height_cm, 3) : null;
 
 // Bodyweight trend (last 180 days — one point per workout)
@@ -230,12 +218,9 @@ $bw_trend = $bw_stmt->fetchAll(PDO::FETCH_ASSOC);
 // BF% trend (chronological for chart). A cycle is a reporting window, not a
 // physiological hard stop: retain the nearest measurement on either side so
 // the line and lean-mass calculation have meaningful continuity.
-$bf_stmt = $db->prepare("
-    SELECT measured_at, DATE(measured_at) as date, waist_cm, neck_cm, hip_cm, caliper_bf_pct
-    FROM body_measurements WHERE 1 = 1{$body_era_clause} ORDER BY measured_at ASC
-");
-$bf_stmt->execute($body_era_params);
-$bf_trend_raw = $bf_stmt->fetchAll(PDO::FETCH_ASSOC);
+$bf_readings = forge_bodyfat_readings($db, $cycle_context === 'all' ? null : $body_era_params[0]);
+$bf_methods_at = fn(string $at): array => forge_bodyfat_at($bf_readings, $at);
+$bf_trend_raw = $bf_readings;
 if ($selected_cycle) {
     $cycle_start = strtotime($selected_cycle['starts_at']);
     $cycle_end = strtotime($as_of_at ?: $selected_cycle['ends_at']);
@@ -255,25 +240,37 @@ if ($selected_cycle) {
     $bf_trend_raw = array_values(array_filter([$before, ...$inside, $after]));
 }
 
-// Pre-compute BF% for each measurement for chart
+// Chart rows: the navy/caliper points are the actual readings, while smoothed
+// averages both methods as interpolated at that moment.
 $bf_trend = [];
 foreach ($bf_trend_raw as $row) {
-    $n = $height_cm > 0 && $row['waist_cm'] && $row['neck_cm']
-        ? forge_navy_bodyfat_pct($profile_sex, $height_cm, (float)$row['waist_cm'], (float)$row['neck_cm'], $row['hip_cm'] !== null ? (float)$row['hip_cm'] : null)
-        : null;
-    $c = $row['caliper_bf_pct'] ? (float)$row['caliper_bf_pct'] : null;
-    $vs = array_filter([$n, $c], fn($v) => $v !== null);
-    $bf_trend[] = ['date' => $row['date'], 'navy' => $n, 'caliper' => $c, 'smoothed' => count($vs) ? round(array_sum($vs)/count($vs),1) : null];
+    $bf_trend[] = ['date' => $row['date'], 'navy' => $row['navy'], 'caliper' => $row['caliper'],
+        'smoothed' => $bf_methods_at($row['measured_at'])['smoothed'], 'estimated' => false];
 }
-// Preserve a meaningful BF line even when the selected cycle sits between two
-// measurements: interpolation is based on the complete era, not clipped data.
+// Carry every method to the cycle edges (or the scrubber date) so a reading
+// taken days earlier still describes the present instead of ending its line.
 if ($selected_cycle) {
     foreach ([$selected_cycle['starts_at'], $as_of_at ?: $selected_cycle['ends_at']] as $boundary) {
-        $bf = forge_cycle_bodyfat($db, (int)$selected_cycle['era_id'], $boundary);
-        if ($bf !== null) $bf_trend[] = ['date' => date('Y-m-d', strtotime($boundary)), 'navy' => null, 'caliper' => $bf, 'smoothed' => $bf];
+        $at = $bf_methods_at($boundary);
+        if ($at['smoothed'] === null) continue;
+        $date = date('Y-m-d', strtotime($boundary));
+        $existing = array_search($date, array_column($bf_trend, 'date'), true);
+        if ($existing === false) {
+            $bf_trend[] = ['date' => $date] + $at + ['estimated' => true];
+        } else {
+            $bf_trend[$existing]['navy'] ??= $at['navy'];
+            $bf_trend[$existing]['caliper'] ??= $at['caliper'];
+        }
     }
     usort($bf_trend, fn($a, $b) => strcmp($a['date'], $b['date']));
 }
+
+$bf_now      = $bf_methods_at($as_of_at ?: ($selected_cycle['ends_at'] ?? date('Y-m-d H:i:s')));
+$navy_bf     = $bf_now['navy'];
+$caliper_bf  = $bf_now['caliper'];
+$smoothed_bf = $bf_now['smoothed'];
+$lean_mass   = ($smoothed_bf !== null && $bw > 0) ? round($bw * (1 - $smoothed_bf / 100), 1) : null;
+$fat_mass    = ($smoothed_bf !== null && $bw > 0) ? round($bw * ($smoothed_bf / 100), 1) : null;
 
 // Estimate BF% at every bodyweight entry by linearly interpolating between
 // measurements. Before the first and after the last measurement, retain the
@@ -281,45 +278,8 @@ if ($selected_cycle) {
 $bf_anchors = array_values(array_filter($bf_trend, fn($row) => $row['smoothed'] !== null));
 $lbm_trend = [];
 if ($bf_anchors) {
-    $estimate_bf_at = function (string $date) use ($bf_anchors): ?float {
-        $date_ts = strtotime($date);
-        $before = null;
-        $after = null;
-        foreach ($bf_anchors as $anchor) {
-            $anchor_ts = strtotime($anchor['date']);
-            if ($anchor_ts <= $date_ts) $before = $anchor;
-            if ($anchor_ts >= $date_ts) {
-                $after = $anchor;
-                break;
-            }
-        }
-        if ($before === null) return (float)$bf_anchors[0]['smoothed'];
-        if ($after === null) return (float)$bf_anchors[count($bf_anchors) - 1]['smoothed'];
-        $before_ts = strtotime($before['date']);
-        $after_ts = strtotime($after['date']);
-        $fraction = $after_ts === $before_ts ? 0 : ($date_ts - $before_ts) / ($after_ts - $before_ts);
-        return (float)$before['smoothed'] + $fraction * ((float)$after['smoothed'] - (float)$before['smoothed']);
-    };
-    $estimate_bw_at = function (string $date) use ($bw_trend): ?float {
-        if (!$bw_trend) return null;
-        $date_ts = strtotime($date);
-        $before = null;
-        $after = null;
-        foreach ($bw_trend as $weight) {
-            $weight_ts = strtotime($weight['date']);
-            if ($weight_ts <= $date_ts) $before = $weight;
-            if ($weight_ts >= $date_ts) {
-                $after = $weight;
-                break;
-            }
-        }
-        if ($before === null) return (float)$bw_trend[0]['bw'];
-        if ($after === null) return (float)$bw_trend[count($bw_trend) - 1]['bw'];
-        $before_ts = strtotime($before['date']);
-        $after_ts = strtotime($after['date']);
-        $fraction = $after_ts === $before_ts ? 0 : ($date_ts - $before_ts) / ($after_ts - $before_ts);
-        return (float)$before['bw'] + $fraction * ((float)$after['bw'] - (float)$before['bw']);
-    };
+    $estimate_bf_at = fn(string $date): ?float => forge_series_at($bf_anchors, 'date', 'smoothed', $date);
+    $estimate_bw_at = fn(string $date): ?float => forge_series_at($bw_trend, 'date', 'bw', $date);
 
     // Keep the usual workout-based points, then add direct BF% measurement
     // dates. A new BF%-only entry therefore produces a lean-mass point using
@@ -879,13 +839,9 @@ function standards_card(array $lift, array $level_names, string $unit): string {
                 <?php
                 $last = count($body_measurements) - 1;
                 foreach ($body_measurements as $mi => $m):
-                    // Compute BF% for this row
-                    $mn = $height_cm > 0 && $m['waist_cm'] && $m['neck_cm']
-                        ? forge_navy_bodyfat_pct($profile_sex, $height_cm, (float)$m['waist_cm'], (float)$m['neck_cm'], $m['hip_cm'] !== null ? (float)$m['hip_cm'] : null)
-                        : null;
+                    // Smoothed BF% at this entry, as plotted on the trend chart
                     $mc = $m['caliper_bf_pct'] ? (float)$m['caliper_bf_pct'] : null;
-                    $mv = array_filter([$mn, $mc], fn($v) => $v !== null);
-                    $ms = count($mv) ? round(array_sum($mv)/count($mv),1) : null;
+                    $ms = $bf_methods_at($m['measured_at'])['smoothed'];
                 ?>
                 <div class="d-flex align-items-center px-3 py-2" style="font-size:0.72rem;<?= $mi === $last ? '' : 'border-bottom:1px solid #1a1a1a;' ?>min-height:40px;">
                     <div style="width:70px;color:#555;font-size:0.65rem;"><?= date('d M', strtotime($m['measured_at'])) ?></div>
@@ -1227,17 +1183,19 @@ function loadBodyCharts() {
     if (bfCanvas && BF_TREND.length) {
         const dates = BF_TREND.map(r => r.date);
         const datasets = [];
+        // Carried-forward edge points extend the lines but are not readings.
+        const bfPointRadius = r => ctx => BF_TREND[ctx.dataIndex]?.estimated ? 0 : r;
         if (BF_TREND.some(r => r.navy !== null)) datasets.push({
             label: 'Navy', data: BF_TREND.map(r => r.navy), borderColor: '#42a5f5',
-            backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 2, tension: 0.3, spanGaps: true,
+            backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: bfPointRadius(2), tension: 0.3, spanGaps: true,
         });
         if (BF_TREND.some(r => r.caliper !== null)) datasets.push({
             label: 'Caliper', data: BF_TREND.map(r => r.caliper), borderColor: '#7e57c2',
-            backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 2, tension: 0.3, spanGaps: true,
+            backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: bfPointRadius(2), tension: 0.3, spanGaps: true,
         });
         if (BF_TREND.some(r => r.smoothed !== null)) datasets.push({
             label: 'Smoothed', data: BF_TREND.map(r => r.smoothed), borderColor: '#FF5722',
-            backgroundColor: 'transparent', borderWidth: 2, pointRadius: 3, tension: 0.3, spanGaps: true,
+            backgroundColor: 'transparent', borderWidth: 2, pointRadius: bfPointRadius(3), tension: 0.3, spanGaps: true,
         });
         new Chart(bfCanvas, {
             type: 'line',

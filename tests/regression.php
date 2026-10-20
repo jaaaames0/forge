@@ -65,6 +65,17 @@ try {
     check((bool)$db->query('SELECT id FROM training_eras WHERE is_active = 1')->fetchColumn(), 'active training era is created');
     check((int)$db->query('SELECT COUNT(*) FROM body_measurements WHERE era_id IS NULL')->fetchColumn() === 0, 'legacy body measurements are assigned to the active era');
     check(forge_navy_bodyfat_pct('M', 176.0, 100.0, 42.0) === 24.7, 'Navy body-fat calculation converts centimetres to inches');
+    $bf_series = [['at' => '2026-11-01', 'navy' => 20.0], ['at' => '2026-11-05', 'navy' => null], ['at' => '2026-11-11', 'navy' => 15.0]];
+    check(forge_series_at($bf_series, 'at', 'navy', '2026-11-06') === 17.5, 'body-fat series interpolates across entries missing that method');
+    check(forge_series_at($bf_series, 'at', 'navy', '2026-11-20') === 15.0, 'body-fat series carries the latest reading forward');
+    $bf_now = forge_bodyfat_at([
+        ['measured_at' => '2026-11-01 08:00:00', 'navy' => 16.0, 'caliper' => null],
+        ['measured_at' => '2026-11-10 08:00:00', 'navy' => null, 'caliper' => 13.0],
+    ], '2026-11-20 08:00:00');
+    check($bf_now['smoothed'] === 14.5, 'smoothed body fat averages each method carried forward');
+    $db->exec("INSERT INTO training_cycles (era_id, cycle_type, starts_at, ends_at, metrics_json) SELECT id, 'cut', '2026-01-01', '2026-02-01', '{\"note\":1}' FROM training_eras WHERE is_active = 1");
+    check(forge_refresh_stale_cycle_metrics($db) === 1 && forge_refresh_stale_cycle_metrics($db) === 0, 'stale cycle metrics are recomputed once');
+    $db->exec("DELETE FROM training_cycles");
 
     $db->exec("INSERT INTO exercises (name, category) VALUES ('Test Press', 'Barbell')");
     $exercise_id = (int)$db->lastInsertId();

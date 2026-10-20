@@ -61,10 +61,13 @@ try {
     foreach (['idx_workout_sets_workout', 'idx_workout_sets_exercise_workout', 'idx_workouts_finished_started'] as $index) {
         check(in_array($index, $indexes, true), "{$index} exists");
     }
-    check((int)$db->query('SELECT MAX(version) FROM schema_migrations')->fetchColumn() === 6, 'schema migration version is recorded');
+    check((int)$db->query('SELECT MAX(version) FROM schema_migrations')->fetchColumn() === 7, 'schema migration version is recorded');
     check((bool)$db->query('SELECT id FROM training_eras WHERE is_active = 1')->fetchColumn(), 'active training era is created');
     check((int)$db->query('SELECT COUNT(*) FROM body_measurements WHERE era_id IS NULL')->fetchColumn() === 0, 'legacy body measurements are assigned to the active era');
     check(forge_navy_bodyfat_pct('M', 176.0, 100.0, 42.0) === 24.7, 'Navy body-fat calculation converts centimetres to inches');
+    check(forge_skinfold_bodyfat_pct('M', 10.5, 38.0) === 14.8 && forge_skinfold_bodyfat_pct('M', 30.5, 23.0) === 24.9, 'skinfold formula reproduces the booklet chart');
+    check(forge_skinfold_bodyfat_pct('M', 40.0, 30.0) === null && forge_skinfold_bodyfat_pct('F', 10.0, 30.0) === null, 'skinfold conversion refuses readings the chart does not cover');
+    check(round((float)forge_age_years('1990-04-20', '2026-10-20 12:00:00'), 1) === 36.5 && forge_age_years('', '2026-10-20') === null, 'age is fractional years from date of birth');
     $bf_series = [['at' => '2026-11-01', 'navy' => 20.0], ['at' => '2026-11-05', 'navy' => null], ['at' => '2026-11-11', 'navy' => 15.0]];
     check(forge_series_at($bf_series, 'at', 'navy', '2026-11-06') === 17.5, 'body-fat series interpolates across entries missing that method');
     check(forge_series_at($bf_series, 'at', 'navy', '2026-11-20') === 15.0, 'body-fat series carries the latest reading forward');

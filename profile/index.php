@@ -35,6 +35,9 @@ $measurements = $db->query("
     SELECT * FROM body_measurements ORDER BY measured_at DESC LIMIT 10
 ")->fetchAll(PDO::FETCH_ASSOC);
 
+// Skinfold mm entry needs the men's chart and an age to read it at
+$skinfold_ok = $profile['sex'] !== 'F' && forge_age_years($profile['dob'], date('Y-m-d H:i:s')) !== null;
+
 // Current body fat: each method carried forward from its latest reading this era
 $bf_readings_by_era = [];
 $bf_readings_for = function (int $era_id) use ($db, &$bf_readings_by_era): array {
@@ -426,7 +429,7 @@ window.forgeWarmupPresets = {
                     <?php if ($m['waist_cm']): ?><span><span class="text-muted">W</span> <?= $m['waist_cm'] ?></span><?php endif; ?>
                     <?php if ($m['neck_cm']): ?><span><span class="text-muted">N</span> <?= $m['neck_cm'] ?></span><?php endif; ?>
                     <?php if ($m['hip_cm']): ?><span><span class="text-muted">H</span> <?= $m['hip_cm'] ?></span><?php endif; ?>
-                    <?php if ($m['caliper_bf_pct']): ?><span><span class="text-muted">Cal</span> <?= $m['caliper_bf_pct'] ?>%</span><?php endif; ?>
+                    <?php if ($m['caliper_bf_pct']): ?><span><span class="text-muted">Cal</span> <?= $m['caliper_mm'] ? (float)$m['caliper_mm'] . 'mm → ' : '' ?><?= number_format((float)$m['caliper_bf_pct'], 1) ?>%</span><?php endif; ?>
                 </div>
                 <?php if ($entry_smoothed !== null): ?>
                 <div style="font-weight:900;font-size:0.85rem;color:#FF5722;flex-shrink:0;"><?= $entry_smoothed ?>%</div>
@@ -570,14 +573,31 @@ window.forgeWarmupPresets = {
                         <label class="stat-label d-block mb-1" style="font-size:0.6rem;">HIP (cm) <span class="text-muted">female</span></label>
                         <input type="number" id="m-hip" class="form-control" inputmode="decimal" step="0.5" placeholder="optional">
                     </div>
-                    <div class="col-6">
-                        <label class="stat-label d-block mb-1" style="font-size:0.6rem;">CALIPER BF%</label>
-                        <input type="number" id="m-caliper" class="form-control" inputmode="decimal" step="0.1" min="1" max="60" placeholder="e.g. 14.5">
+                    <div class="col-12">
+                        <div class="d-flex align-items-center justify-content-between mb-1">
+                            <label class="stat-label mb-0" style="font-size:0.6rem;">CALIPER</label>
+                            <?php if ($skinfold_ok): ?>
+                            <div class="d-flex gap-1" style="width:120px;">
+                                <button type="button" class="btn flex-grow-1 btn-forge cal-unit-btn" data-unit="mm" onclick="setCaliperUnit('mm')" style="font-weight:900;font-size:0.75rem;">MM</button>
+                                <button type="button" class="btn flex-grow-1 cal-unit-btn" data-unit="pct" onclick="setCaliperUnit('pct')" style="background:#1a1a1a;border:1px solid #333;color:#888;font-weight:900;font-size:0.75rem;">%</button>
+                            </div>
+                            <?php endif; ?>
+                        </div>
+                        <input type="number" id="m-caliper" class="form-control" inputmode="decimal" step="0.1"
+                               <?= $skinfold_ok ? 'min="2" max="36" placeholder="skinfold mm, e.g. 5.5"' : 'min="1" max="60" placeholder="BF%, e.g. 14.5"' ?>
+                               oninput="updateCaliperPreview()">
+                        <div id="m-caliper-preview" class="mt-1" style="font-size:0.7rem;color:#FF5722;min-height:1em;"></div>
                     </div>
                 </div>
-                <div class="text-muted mt-3" style="font-size:0.7rem;">
+                <div class="text-muted mt-2" style="font-size:0.7rem;">
                     Navy BF% is calculated from waist + neck + height + sex.<br>
-                    Enter caliper BF% directly from your skinfold reading.
+                    <?php if ($skinfold_ok): ?>
+                    Caliper: enter the skinfold in mm and it is converted using your age, or switch to % to enter BF% directly.
+                    <?php elseif ($profile['sex'] === 'F'): ?>
+                    Enter caliper BF% from your skinfold chart.
+                    <?php else: ?>
+                    Enter caliper BF% directly, or set your date of birth above to enter the skinfold in mm.
+                    <?php endif; ?>
                 </div>
             </div>
             <div class="modal-footer" style="border-top:1px solid #333;">
@@ -618,6 +638,40 @@ function setSex(val) {
     saveSetting('profile_sex', val);
 }
 
+// ── Caliper: skinfold mm (converted with the booklet chart's formula) or BF% ─
+const SKINFOLD = <?= json_encode($skinfold_ok ? ['dob' => $profile['dob']] + FORGE_SKINFOLD_MEN : null) ?>;
+let caliperUnit = SKINFOLD ? 'mm' : 'pct';
+
+function skinfoldBodyfat(mm) {
+    if (!SKINFOLD || !(mm >= SKINFOLD.min_mm && mm <= SKINFOLD.max_mm)) return null;
+    const age = (Date.now() - new Date(SKINFOLD.dob + 'T00:00:00')) / (365.2425 * 86400000);
+    const [a, b, c, d] = SKINFOLD.coef;
+    return { pct: Math.round((a + b * mm + c * mm * mm + d * age) * 10) / 10, age: Math.floor(age) };
+}
+
+function setCaliperUnit(unit) {
+    caliperUnit = unit;
+    document.querySelectorAll('.cal-unit-btn').forEach(b => {
+        const active = b.dataset.unit === unit;
+        b.className = active ? 'btn flex-grow-1 btn-forge cal-unit-btn' : 'btn flex-grow-1 cal-unit-btn';
+        b.style.cssText = active ? 'font-weight:900;font-size:0.75rem;'
+                                 : 'background:#1a1a1a;border:1px solid #333;color:#888;font-weight:900;font-size:0.75rem;';
+    });
+    const input = document.getElementById('m-caliper');
+    Object.assign(input, unit === 'mm'
+        ? { min: SKINFOLD.min_mm, max: SKINFOLD.max_mm, placeholder: 'skinfold mm, e.g. 5.5' }
+        : { min: 1, max: 60, placeholder: 'BF%, e.g. 14.5' });
+    updateCaliperPreview();
+}
+
+function updateCaliperPreview() {
+    const preview = document.getElementById('m-caliper-preview');
+    const raw = document.getElementById('m-caliper').value;
+    if (caliperUnit !== 'mm' || raw === '') { preview.textContent = ''; return; }
+    const r = skinfoldBodyfat(parseFloat(raw));
+    preview.textContent = r ? `≈ ${r.pct.toFixed(1)}% body fat at age ${r.age}` : `Chart covers ${SKINFOLD.min_mm}–${SKINFOLD.max_mm} mm`;
+}
+
 async function logMeasurement() {
     const waist   = document.getElementById('m-waist').value;
     const neck    = document.getElementById('m-neck').value;
@@ -627,8 +681,13 @@ async function logMeasurement() {
         alert('Enter at least one measurement.');
         return;
     }
+    if (caliper && caliperUnit === 'mm' && !skinfoldBodyfat(parseFloat(caliper))) {
+        alert(`Skinfold must be ${SKINFOLD.min_mm}–${SKINFOLD.max_mm} mm, or switch to % to enter BF% directly.`);
+        return;
+    }
     const r = await api('save_body_measurement', {
-        waist_cm: waist, neck_cm: neck, hip_cm: hip, caliper_bf_pct: caliper
+        waist_cm: waist, neck_cm: neck, hip_cm: hip,
+        [caliperUnit === 'mm' ? 'caliper_mm' : 'caliper_bf_pct']: caliper
     });
     if (r.status === 'success') location.reload();
     else alert(r.message);

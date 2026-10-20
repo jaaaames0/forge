@@ -770,11 +770,18 @@ try {
         $waist     = $_POST['waist_cm']       ? (float)$_POST['waist_cm']       : null;
         $neck      = $_POST['neck_cm']        ? (float)$_POST['neck_cm']        : null;
         $hip       = $_POST['hip_cm']         ? (float)$_POST['hip_cm']         : null;
-        $caliper   = $_POST['caliper_bf_pct'] ? (float)$_POST['caliper_bf_pct'] : null;
+        $caliper   = !empty($_POST['caliper_bf_pct']) ? (float)$_POST['caliper_bf_pct'] : null;
+        $caliper_mm = !empty($_POST['caliper_mm']) ? (float)$_POST['caliper_mm'] : null;
         $measured_at = date('Y-m-d H:i:s');
+        if ($caliper_mm !== null) {
+            $age = forge_age_years(get_user_setting($db, 'profile_dob', ''), $measured_at);
+            if ($age === null) throw new Exception('Set your date of birth in Profile to convert skinfold mm to BF%');
+            $caliper = forge_skinfold_bodyfat_pct(get_user_setting($db, 'profile_sex', 'M'), $caliper_mm, $age);
+            if ($caliper === null) throw new Exception('Skinfold must be 2–36 mm (men only); enter BF% instead');
+        }
         if (!$waist && !$neck && !$hip && !$caliper) throw new Exception('At least one measurement required');
-        $db->prepare("INSERT INTO body_measurements (measured_at, waist_cm, neck_cm, hip_cm, caliper_bf_pct, era_id) VALUES (?,?,?,?,?,?)")
-           ->execute([$measured_at, $waist, $neck, $hip, $caliper, $active_era_id]);
+        $db->prepare("INSERT INTO body_measurements (measured_at, waist_cm, neck_cm, hip_cm, caliper_bf_pct, caliper_mm, era_id) VALUES (?,?,?,?,?,?,?)")
+           ->execute([$measured_at, $waist, $neck, $hip, $caliper, $caliper_mm, $active_era_id]);
         echo json_encode(['status' => 'success', 'data' => ['id' => (int)$db->lastInsertId()]]);
 
     } elseif ($action === 'log_hr_sample') {

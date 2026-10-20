@@ -137,7 +137,8 @@ CREATE TABLE IF NOT EXISTS body_measurements (
     waist_cm        REAL,
     neck_cm         REAL,
     hip_cm          REAL,
-    caliper_bf_pct  REAL,   -- user-entered BF% from skinfold calipers
+    caliper_bf_pct  REAL,   -- caliper BF%, entered or converted from caliper_mm
+    caliper_mm      REAL,   -- raw skinfold reading in mm, when entered that way
     era_id          INTEGER DEFAULT NULL REFERENCES training_eras(id),
     source          TEXT DEFAULT 'manual'
 );

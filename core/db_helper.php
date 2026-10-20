@@ -5,7 +5,7 @@
 
 date_default_timezone_set('Australia/Sydney');
 
-const FORGE_SCHEMA_VERSION = 6;
+const FORGE_SCHEMA_VERSION = 7;
 
 function get_db_connection(): PDO {
     $dbPath = getenv('FORGE_DB_PATH') ?: __DIR__ . '/../database/forge.db';
@@ -39,6 +39,28 @@ function forge_navy_bodyfat_pct(string $sex, float $height_cm, ?float $waist_cm,
         return round(163.205 * log10($circumference_in) - 97.684 * log10($height_in) - 78.387, 1);
     }
     return round(86.01 * log10($waist_in - $neck_in) - 70.041 * log10($height_in) + 36.76, 1);
+}
+
+/**
+ * Men's single-site skinfold chart from the caliper booklet, as the formula it
+ * was printed from: a fit over every cell matches the chart to its rounding
+ * (RMS 0.03 points), so this removes the 2 mm bands and 5-year age brackets.
+ * Coefficients for 1, mm, mm², age (years, fractional).
+ */
+const FORGE_SKINFOLD_MEN = ['coef' => [-5.807, 1.3753, -0.017386, 0.2129], 'min_mm' => 2.0, 'max_mm' => 36.0];
+
+/** Body-fat % from a skinfold reading, or null outside the chart's range or for women (no chart yet). */
+function forge_skinfold_bodyfat_pct(string $sex, float $mm, float $age_years): ?float {
+    if ($sex === 'F' || $mm < FORGE_SKINFOLD_MEN['min_mm'] || $mm > FORGE_SKINFOLD_MEN['max_mm'] || $age_years <= 0) return null;
+    [$a, $b, $c, $d] = FORGE_SKINFOLD_MEN['coef'];
+    return round($a + $b * $mm + $c * $mm * $mm + $d * $age_years, 1);
+}
+
+/** Age in fractional years on $at, or null without a valid date of birth. */
+function forge_age_years(string $dob, string $at): ?float {
+    $born = strtotime($dob); $t = strtotime($at);
+    if ($born === false || $t === false || $t <= $born) return null;
+    return ($t - $born) / (365.2425 * 86400);
 }
 
 /** Keep current-era workout weigh-ins available for interpolation. */
@@ -245,6 +267,9 @@ function maybe_migrate_schema(PDO $db): void {
     $bm_cols = array_column($db->query("PRAGMA table_info(body_measurements)")->fetchAll(PDO::FETCH_ASSOC), 'name');
     if (!in_array('era_id', $bm_cols)) {
         $db->exec("ALTER TABLE body_measurements ADD COLUMN era_id INTEGER DEFAULT NULL REFERENCES training_eras(id)");
+    }
+    if (!in_array('caliper_mm', $bm_cols)) {
+        $db->exec("ALTER TABLE body_measurements ADD COLUMN caliper_mm REAL DEFAULT NULL");
     }
     if (!in_array('source', $bm_cols)) {
         $db->exec("ALTER TABLE body_measurements ADD COLUMN source TEXT DEFAULT 'manual'");

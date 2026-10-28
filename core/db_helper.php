@@ -5,7 +5,7 @@
 
 date_default_timezone_set('Australia/Sydney');
 
-const FORGE_SCHEMA_VERSION = 7;
+const FORGE_SCHEMA_VERSION = 8;
 
 function get_db_connection(): PDO {
     $dbPath = getenv('FORGE_DB_PATH') ?: __DIR__ . '/../database/forge.db';
@@ -274,6 +274,10 @@ function maybe_migrate_schema(PDO $db): void {
     if (!in_array('source', $bm_cols)) {
         $db->exec("ALTER TABLE body_measurements ADD COLUMN source TEXT DEFAULT 'manual'");
     }
+    // Smoothed body fat stored for the Spence export, which cannot run PHP.
+    if (!in_array('smoothed_bf_pct', $bm_cols)) {
+        $db->exec("ALTER TABLE body_measurements ADD COLUMN smoothed_bf_pct REAL DEFAULT NULL");
+    }
 
     $active_era = $db->query("SELECT id FROM training_eras WHERE is_active = 1 ORDER BY id DESC LIMIT 1")->fetchColumn();
     if (!$active_era) {
@@ -285,6 +289,8 @@ function maybe_migrate_schema(PDO $db): void {
     }
     $db->prepare("UPDATE workouts SET era_id = ? WHERE era_id IS NULL")->execute([$active_era]);
     $db->prepare("UPDATE body_measurements SET era_id = ? WHERE era_id IS NULL")->execute([$active_era]);
+    require_once __DIR__ . '/cycle_analysis.php';
+    forge_refresh_smoothed_bodyfat($db);
 
     // Keep the common history and dashboard lookups fast as workout history grows.
     $db->exec('CREATE INDEX IF NOT EXISTS idx_workout_sets_workout ON workout_sets(workout_id)');

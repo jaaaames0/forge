@@ -61,9 +61,10 @@ try {
     foreach (['idx_workout_sets_workout', 'idx_workout_sets_exercise_workout', 'idx_workouts_finished_started'] as $index) {
         check(in_array($index, $indexes, true), "{$index} exists");
     }
-    check((int)$db->query('SELECT MAX(version) FROM schema_migrations')->fetchColumn() === 7, 'schema migration version is recorded');
+    check((int)$db->query('SELECT MAX(version) FROM schema_migrations')->fetchColumn() === 8, 'schema migration version is recorded');
     check((bool)$db->query('SELECT id FROM training_eras WHERE is_active = 1')->fetchColumn(), 'active training era is created');
     check((int)$db->query('SELECT COUNT(*) FROM body_measurements WHERE era_id IS NULL')->fetchColumn() === 0, 'legacy body measurements are assigned to the active era');
+    check((float)$db->query('SELECT smoothed_bf_pct FROM body_measurements')->fetchColumn() === 20.0, 'migration backfills stored smoothed body fat');
     check(forge_navy_bodyfat_pct('M', 176.0, 100.0, 42.0) === 24.7, 'Navy body-fat calculation converts centimetres to inches');
     check(forge_skinfold_bodyfat_pct('M', 10.5, 38.0) === 14.8 && forge_skinfold_bodyfat_pct('M', 30.5, 23.0) === 24.9, 'skinfold formula reproduces the booklet chart');
     check(forge_skinfold_bodyfat_pct('M', 40.0, 30.0) === null && forge_skinfold_bodyfat_pct('F', 10.0, 30.0) === null, 'skinfold conversion refuses readings the chart does not cover');
@@ -76,6 +77,42 @@ try {
         ['measured_at' => '2026-11-10 08:00:00', 'navy' => null, 'caliper' => 13.0],
     ], '2026-11-20 08:00:00');
     check($bf_now['smoothed'] === 14.5, 'smoothed body fat averages each method carried forward');
+
+    // Stored smoothed body fat (read by the Spence export) must always equal
+    // forge_bodyfat_at() for every row in the era, including earlier ones.
+    $bf_era = (int)$db->query("SELECT id FROM training_eras WHERE is_active = 1")->fetchColumn();
+    $stored_bf_matches = function () use ($db, $bf_era): bool {
+        $readings = forge_bodyfat_readings($db, $bf_era);
+        $stored = $db->prepare('SELECT smoothed_bf_pct FROM body_measurements WHERE id = ?');
+        foreach ($readings as $row) {
+            $stored->execute([$row['id']]);
+            $value = $stored->fetchColumn();
+            if (($value === null ? null : (float)$value) !== forge_bodyfat_at($readings, $row['measured_at'])['smoothed']) return false;
+        }
+        return true;
+    };
+    $stored_bf = fn(int $id): ?float => ($v = $db->query("SELECT smoothed_bf_pct FROM body_measurements WHERE id = {$id}")->fetchColumn()) === null ? null : (float)$v;
+    set_user_setting($db, 'profile_sex', 'M');
+    set_user_setting($db, 'profile_height_cm', '176');
+    $add_bf = $db->prepare('INSERT INTO body_measurements (measured_at, waist_cm, neck_cm, caliper_bf_pct, era_id) VALUES (?, ?, ?, ?, ?)');
+    $add_bf->execute(['2026-02-01 08:00:00', 100.0, 42.0, null, $bf_era]);
+    $bf_first = (int)$db->lastInsertId();
+    forge_refresh_smoothed_bodyfat($db, $bf_era);
+    $add_bf->execute(['2026-02-11 08:00:00', 98.0, 42.0, 15.0, $bf_era]);
+    forge_refresh_smoothed_bodyfat($db, $bf_era);
+    check($stored_bf_matches(), 'stored smoothed body fat matches after an add');
+    $before_edit = $stored_bf($bf_first);
+    $db->prepare('UPDATE body_measurements SET waist_cm = 96.0 WHERE id = ?')->execute([$bf_first]);
+    forge_refresh_smoothed_bodyfat($db, $bf_era);
+    check($stored_bf_matches() && $stored_bf($bf_first) !== $before_edit, 'stored smoothed body fat matches after editing an earlier reading');
+    $before_height = $stored_bf($bf_first);
+    set_user_setting($db, 'profile_height_cm', '186');
+    forge_refresh_smoothed_bodyfat($db);
+    check($stored_bf_matches() && $stored_bf($bf_first) !== $before_height, 'stored smoothed body fat matches after a height change');
+    $api_source = file_get_contents(__DIR__ . '/../core/api.php');
+    check($api_source !== false && substr_count($api_source, 'forge_refresh_smoothed_bodyfat(') === 3, 'API refreshes stored body fat on add, delete and sex/height change');
+    $db->exec("DELETE FROM body_measurements WHERE measured_at >= '2026-02-01'");
+
     $db->exec("INSERT INTO training_cycles (era_id, cycle_type, starts_at, ends_at, metrics_json) SELECT id, 'cut', '2026-01-01', '2026-02-01', '{\"note\":1}' FROM training_eras WHERE is_active = 1");
     check(forge_refresh_stale_cycle_metrics($db) === 1 && forge_refresh_stale_cycle_metrics($db) === 0, 'stale cycle metrics are recomputed once');
     $db->exec("DELETE FROM training_cycles");

@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/../core/db_helper.php';
+require_once __DIR__ . '/../core/cycle_analysis.php';
 
 $apply = in_array('--apply', $argv, true);
 $db = get_db_connection();
@@ -37,6 +38,7 @@ try {
     foreach ($anchors as [$at, $bodyfat]) {
         $insert->execute([$at, $bodyfat, (int)$era['id']]);
     }
+    forge_refresh_smoothed_bodyfat($db, (int)$era['id']);
     $db->commit();
     echo count($anchors) . " historical body-fat anchors saved.\n";
 } catch (Throwable $e) {

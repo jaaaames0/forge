@@ -764,6 +764,7 @@ try {
                     'warmup_presets_compound', 'warmup_presets_bodyweight', 'warmup_presets_accessory'];
         if (!in_array($key, $allowed)) throw new Exception('Unknown setting key');
         set_user_setting($db, $key, $value);
+        if ($key === 'profile_sex' || $key === 'profile_height_cm') forge_refresh_smoothed_bodyfat($db);
         echo json_encode(['status' => 'success']);
 
     } elseif ($action === 'save_body_measurement') {
@@ -782,7 +783,9 @@ try {
         if (!$waist && !$neck && !$hip && !$caliper) throw new Exception('At least one measurement required');
         $db->prepare("INSERT INTO body_measurements (measured_at, waist_cm, neck_cm, hip_cm, caliper_bf_pct, caliper_mm, era_id) VALUES (?,?,?,?,?,?,?)")
            ->execute([$measured_at, $waist, $neck, $hip, $caliper, $caliper_mm, $active_era_id]);
-        echo json_encode(['status' => 'success', 'data' => ['id' => (int)$db->lastInsertId()]]);
+        $id = (int)$db->lastInsertId();
+        forge_refresh_smoothed_bodyfat($db, $active_era_id);
+        echo json_encode(['status' => 'success', 'data' => ['id' => $id]]);
 
     } elseif ($action === 'log_hr_sample') {
         $workout_id  = (int)($_POST['workout_id'] ?? 0);
@@ -816,7 +819,11 @@ try {
     } elseif ($action === 'delete_body_measurement') {
         $id = (int)($_POST['id'] ?? 0);
         if (!$id) throw new Exception('id required');
+        $era = $db->prepare("SELECT era_id FROM body_measurements WHERE id = ?");
+        $era->execute([$id]);
+        $era_id = $era->fetchColumn();
         $db->prepare("DELETE FROM body_measurements WHERE id = ?")->execute([$id]);
+        if ($era_id) forge_refresh_smoothed_bodyfat($db, (int)$era_id);
         echo json_encode(['status' => 'success']);
 
     } elseif ($action === 'get_last_exercise_sets') {

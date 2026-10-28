@@ -11,6 +11,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/../core/db_helper.php';
+require_once __DIR__ . '/../core/cycle_analysis.php';
 
 $source_dir = $argv[1] ?? '';
 $commit = in_array('--import', $argv, true);
@@ -160,6 +161,7 @@ try {
             }
         }
     }
+    forge_refresh_smoothed_bodyfat($db, $era_id);
     $db->commit();
     echo "Imported into the Strong archive era.\n";
 } catch (Throwable $e) {

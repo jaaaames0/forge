@@ -140,7 +140,8 @@ CREATE TABLE IF NOT EXISTS body_measurements (
     caliper_bf_pct  REAL,   -- caliper BF%, entered or converted from caliper_mm
     caliper_mm      REAL,   -- raw skinfold reading in mm, when entered that way
     era_id          INTEGER DEFAULT NULL REFERENCES training_eras(id),
-    source          TEXT DEFAULT 'manual'
+    source          TEXT DEFAULT 'manual',
+    smoothed_bf_pct REAL    -- forge_bodyfat_at()['smoothed'] at measured_at, kept for the Spence export
 );
 
 CREATE TABLE IF NOT EXISTS bodyweight_measurements (

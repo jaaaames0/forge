@@ -79,6 +79,27 @@ function forge_bodyfat_at(array $readings, string $at): array {
     ];
 }
 
+/**
+ * Store each measurement's smoothed body fat in body_measurements.smoothed_bf_pct
+ * so non-PHP readers (the Spence export) can copy it. Interpolation means one
+ * reading can move its neighbours, so a whole era is recomputed; pass null to
+ * recompute every era (e.g. after a sex or height change). Returns rows written.
+ */
+function forge_refresh_smoothed_bodyfat(PDO $db, ?int $era_id = null): int {
+    $eras = $era_id !== null ? [$era_id]
+        : array_map('intval', $db->query('SELECT DISTINCT era_id FROM body_measurements WHERE era_id IS NOT NULL')->fetchAll(PDO::FETCH_COLUMN));
+    $update = $db->prepare('UPDATE body_measurements SET smoothed_bf_pct = ? WHERE id = ?');
+    $written = 0;
+    foreach ($eras as $era) {
+        $readings = forge_bodyfat_readings($db, $era);
+        foreach ($readings as $row) {
+            $update->execute([forge_bodyfat_at($readings, $row['measured_at'])['smoothed'], $row['id']]);
+            $written++;
+        }
+    }
+    return $written;
+}
+
 /** Smoothed body fat within an era at $at; pass $readings when calling in a loop. */
 function forge_cycle_bodyfat(PDO $db, int $era_id, string $at, ?array $readings = null): ?float {
     return forge_bodyfat_at($readings ?? forge_bodyfat_readings($db, $era_id), $at)['smoothed'];
